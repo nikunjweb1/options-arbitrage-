@@ -38,31 +38,42 @@ start Phase N+1 until Phase N's exit criterion is met.
 
 ## Current status
 
-**Phase 2: market-data collectors.** Delta Exchange India adapter only. No trading logic
-exists yet. No CoinSwitch or Shark adapters exist yet — CoinSwitch's options API is
-"available on request" (not self-serve docs) and Shark Exchange has no public options API
-documentation found; both are blocked pending real documentation, not implemented against
-guesses.
+**Phase 2: market-data collectors — adapter built, collector built, validation pending.**
+Delta Exchange India adapter and a continuous instrument+ticker collector exist. What's
+still outstanding before Phase 2 can be marked done is an actual **24h continuous run
+against Delta testnet**, verified gap-free via `collectors/gap_report.py` — nothing in this
+repo claims that run has happened yet just because the code to do it exists.
+
+No CoinSwitch or Shark adapters exist yet — CoinSwitch's options API is "available on
+request" (not self-serve docs) and Shark Exchange has no public options API documentation
+found; both are blocked pending real documentation, not implemented against guesses.
 
 ## Repository layout
 
 ```
 docs/
-  architecture.md          # full architecture, research findings, MVP plan (source of truth)
+  architecture.md            # full architecture, research findings, MVP plan (source of truth)
 exchange_adapters/
-  base.py                  # ExchangeAdapter protocol — every adapter implements this
-  delta.py                 # Delta Exchange India adapter (testnet-first)
+  base.py                    # ExchangeAdapter protocol — every adapter implements this
+  delta.py                   # Delta Exchange India adapter (testnet-first, read-only in Phase 2)
 normalization/
-  schemas.py               # OptionContract, MarketSnapshot, etc. — exchange-agnostic
+  schemas.py                 # OptionContract, MarketSnapshot, etc. — exchange-agnostic
+collectors/
+  market_data_collector.py    # continuous instrument+ticker capture into SQLite
+  run.py                       # CLI entry point (python -m collectors.run)
+  gap_report.py                 # verifies the Phase 2 "24h gap-free" exit criterion
 db/
-  schema.sql                # SQLite schema for Phase 2 (instruments, market_data, ...)
-  init_db.py                 # creates a local SQLite DB from schema.sql
+  schema.sql                   # SQLite schema for Phase 2 (instruments, market_data, ...)
+  init_db.py                    # creates a local SQLite DB from schema.sql
 config/
-  settings.py                # env-driven config, LIVE_TRADING default enforced here
-  .env.example                # no real secrets, ever
+  settings.py                   # env-driven config, LIVE_TRADING hardcoded default
+  .env.example                   # no real secrets, ever
 tests/
-  test_delta_adapter.py       # adapter tests, run against Delta testnet
+  test_delta_adapter.py          # normalization unit tests, fixture-based, no network
+  test_delta_integration.py       # real testnet integration suite, skipped unless explicitly enabled
+  test_gap_report.py               # gap-detection unit tests, no network
 requirements.txt
+pyproject.toml
 .gitignore
 ```
 
@@ -78,6 +89,21 @@ python db/init_db.py
 
 Never commit `.env`, API keys, or account identifiers. `.gitignore` is configured to block
 common secret file patterns, but review diffs before pushing regardless.
+
+## Running tests
+
+```bash
+pytest tests/                                            # unit tests only (default, no network)
+RUN_INTEGRATION_TESTS=true pytest tests/test_delta_integration.py -v -s   # real testnet, explicit opt-in
+```
+
+## Running the collector
+
+```bash
+python -m collectors.run --once              # single cycle, smoke-test the wiring
+python -m collectors.run --duration-hours 24  # the actual Phase 2 validation run
+python -m collectors.gap_report               # check the result for gaps once it's done (or while running)
+```
 
 ## License note
 
