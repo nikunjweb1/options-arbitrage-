@@ -40,8 +40,8 @@ too large to fully retrieve during this research pass. The subscribe/unsubscribe
 shape used in `exchange_adapters/delta_ws.py` is reconstructed from two independent
 community sources that agree with each other, not copied directly from
 `docs.delta.exchange`. This needs to be validated against a live testnet connection before
-being trusted for anything beyond Phase 2 — see the module docstring in `delta_ws.py` for
-specifics and what to check.
+being trusted for anything beyond Phase 2 — see the module docstring in `delta_ws.py`, and
+run `tests/test_delta_ws_integration.py` for the actual validation, for specifics.
 
 REST (`collectors/market_data_collector.py`) still exists for instrument-specification
 lookups (which don't need to be real-time) and as a fallback/smoke-test path.
@@ -57,13 +57,18 @@ start Phase N+1 until Phase N's exit criterion is met.
 
 ## Current status
 
-**Phase 2: market-data collectors — adapters built (REST + WebSocket), validation pending.**
-Delta Exchange India REST adapter, WebSocket client, and both a polling collector and a
-real-time collector exist. What's still outstanding before Phase 2 can be marked done is an
-actual **24h continuous run against Delta testnet** using the realtime collector, verified
-gap-free via `collectors/gap_report.py` — nothing in this repo claims that run has happened
-yet just because the code to do it exists. The WebSocket message-format assumptions also
-need testnet confirmation (see "Speed requirement" above) before this is fully trusted.
+**Phase 2: market-data collectors — adapters and integration tests built, real testnet
+validation run still pending.** Delta Exchange India REST adapter, WebSocket client, both a
+polling collector and a real-time collector, and integration test suites for both (REST and
+WS) exist. What's still outstanding before Phase 2 can be marked done:
+
+1. Actually running `RUN_INTEGRATION_TESTS=true pytest tests/test_delta_ws_integration.py -v -s`
+   against real testnet, to confirm the WebSocket subscribe/message-format assumptions hold.
+2. A **24h continuous run** using the realtime collector, verified gap-free via
+   `collectors/gap_report.py`.
+
+Nothing in this repo claims either of those has happened yet just because the code to do
+them exists.
 
 No CoinSwitch or Shark adapters exist yet — CoinSwitch's options API is "available on
 request" (not self-serve docs) and Shark Exchange has no public options API documentation
@@ -95,7 +100,8 @@ config/
 tests/
   test_delta_adapter.py                 # REST normalization unit tests, fixture-based, no network
   test_delta_ws.py                       # WS parsing + flush-ceiling unit tests, no network
-  test_delta_integration.py               # real testnet integration suite, skipped unless explicitly enabled
+  test_delta_integration.py               # real testnet REST integration suite, skipped unless explicitly enabled
+  test_delta_ws_integration.py             # real testnet WS integration suite (subscribe format, reconnect, e2e persistence), skipped unless explicitly enabled
   test_gap_report.py                       # gap-detection unit tests, no network
 requirements.txt
 pyproject.toml
@@ -118,8 +124,9 @@ common secret file patterns, but review diffs before pushing regardless.
 ## Running tests
 
 ```bash
-pytest tests/                                            # unit tests only (default, no network)
-RUN_INTEGRATION_TESTS=true pytest tests/test_delta_integration.py -v -s   # real testnet, explicit opt-in
+pytest tests/                                                                 # unit tests only (default, no network)
+RUN_INTEGRATION_TESTS=true pytest tests/test_delta_integration.py -v -s        # real testnet REST, explicit opt-in
+RUN_INTEGRATION_TESTS=true pytest tests/test_delta_ws_integration.py -v -s      # real testnet WS, explicit opt-in
 ```
 
 ## Running the collector
