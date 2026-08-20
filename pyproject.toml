@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+markers = [
+    "integration: hits a real exchange (testnet by default). Skipped unless RUN_INTEGRATION_TESTS=true.",
+]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
