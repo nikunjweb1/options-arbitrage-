@@ -100,6 +100,50 @@ class DBConfig:
     sqlite_path: Path = Path(os.getenv("SQLITE_PATH", "data/options_arb.db"))
 
 
+@dataclass(frozen=True)
+class CollectorConfig:
+    """
+    Phase 2 market-data collector settings. See collectors/market_data_collector.py.
+
+    Defaults are conservative on purpose: Delta's documented rate limit is
+    500 ops/sec/product, which is nowhere near a binding constraint at these
+    intervals, but a continuous 24h+ unattended collector should still be
+    polite to a shared testnet rather than push limits just because it can.
+    """
+
+    # Comma-separated underlyings to track, e.g. "BTC,ETH"
+    underlyings: tuple[str, ...] = tuple(
+        u.strip().upper() for u in os.getenv("COLLECT_UNDERLYINGS", "BTC").split(",") if u.strip()
+    )
+
+    # How often to re-pull the full instrument list (new strikes/maturities
+    # get added intraday per architecture.md Section E.3).
+    instrument_refresh_interval_sec: int = int(
+        os.getenv("INSTRUMENT_REFRESH_INTERVAL_SEC", str(5 * 60))
+    )
+
+    # How often to poll tickers for every tracked instrument.
+    ticker_poll_interval_sec: int = int(os.getenv("TICKER_POLL_INTERVAL_SEC", "30"))
+
+    # Small delay between individual per-instrument ticker requests within a
+    # single poll pass, to avoid bursting the API even though the documented
+    # limit is generous.
+    request_throttle_sec: float = float(os.getenv("REQUEST_THROTTLE_SEC", "0.05"))
+
+    # Safety cap on how many instruments get polled per underlying per pass,
+    # in case an underlying's chain is unexpectedly huge. 0 = no cap.
+    max_instruments_per_underlying: int = int(
+        os.getenv("MAX_INSTRUMENTS_PER_UNDERLYING", "0")
+    )
+
+    # Retry behavior for transient network/API errors during collection.
+    max_retries_per_call: int = int(os.getenv("COLLECTOR_MAX_RETRIES", "3"))
+    retry_backoff_base_sec: float = float(os.getenv("COLLECTOR_RETRY_BACKOFF_SEC", "1.0"))
+
+    log_path: Path = Path(os.getenv("COLLECTOR_LOG_PATH", "logs/collector.log"))
+
+
 DELTA = DeltaConfig()
 RISK = RiskLimits()
 DB = DBConfig()
+COLLECTOR = CollectorConfig()
