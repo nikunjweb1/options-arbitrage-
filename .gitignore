@@ -1,1 +1,37 @@
-PLACEHOLDER
+# Secrets — never commit these
+.env
+config/.env
+*.pem
+*.key
+**/secrets.py
+
+# API credentials of any kind
+**/api_keys*
+**/*credentials*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local databases (Phase 2 SQLite output — never commit real market data dumps)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# OS/editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+logs/
