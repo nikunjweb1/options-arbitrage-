@@ -11,15 +11,26 @@ contents is the list of public channel names this file relies on:
     ticker, ob_l1, ob_l2, ob_updates, trades, mark_price, candlesticks,
     spot_price, spot_30mtwap_price, funding_rate, product_updates, system_status
 
-The exact subscribe/unsubscribe JSON message shape used below --
+CHANNEL NAME CORRECTION (2026-08-21, confirmed against live testnet): the
+plain channel name "ticker" is REJECTED by the server with
+{"error": "subscription forbidden on this channel. Use appropriate pod."}.
+The correct, working channel name is "v2/ticker" -- confirmed by directly
+subscribing against wss://socket-ind.testnet.deltaex.org and receiving real
+ticker payloads. Incoming messages on this channel also carry
+"type": "v2/ticker" (NOT "type": "ticker") -- both the subscribe payload
+and the incoming-message type filter must use "v2/ticker" consistently.
+This was originally missed because the two community sources used to
+reconstruct the subscribe shape didn't happen to mention this -- treat any
+other channel name in this codebase reconstructed the same way (ob_l1,
+ob_l2, trades, etc.) as similarly unconfirmed until independently verified
+against a live connection the same way.
+
+The subscribe/unsubscribe JSON message shape itself --
 
     {"type": "subscribe", "payload": {"channels": [{"name": ..., "symbols": [...]}]}}
 
--- is reconstructed from two independent community sources (a public Python
-client and a blog walkthrough), not copied verbatim from the official docs
-page, because that page's relevant section didn't fit in the fetch. Both
-sources agree with each other, which is reasonable but not the same as
-reading it directly off docs.delta.exchange.
+-- IS confirmed correct against a live testnet connection (only the channel
+name inside it was wrong).
 
 **Before relying on this for anything beyond Phase 2 data collection,
 validate the actual message shapes against a live testnet connection** (see
@@ -29,7 +40,7 @@ Do not silently assume the shape below is exactly right.
 
 Design:
   - Runs in a background thread (websocket-client's run_forever loop).
-  - Subscribes to the "ticker" channel for a configurable symbol list --
+  - Subscribes to the "v2/ticker" channel for a configurable symbol list --
     this is the channel that carries best_bid/best_ask/greeks/IV per the
     REST ticker schema, so parsing reuses the same field names as
     exchange_adapters/delta.py's REST ticker parsing wherever the shapes
@@ -61,6 +72,8 @@ from normalization.schemas import MarketSnapshot
 logger = logging.getLogger("delta_ws")
 
 MarketSnapshotCallback = Callable[[MarketSnapshot], None]
+
+_TICKER_CHANNEL = "v2/ticker"
 
 
 class DeltaWebSocketClient:
@@ -165,20 +178,20 @@ class DeltaWebSocketClient:
         logger.error("WebSocket error: %s", error)
 
     def _send_subscribe(self, symbols: list[str]) -> None:
-        # Message shape per the community-sourced format documented in this
-        # module's docstring -- see the honesty note above before trusting
-        # this blindly against production.
+        # Message shape confirmed against a live testnet connection
+        # 2026-08-21 -- see module docstring for the channel-name correction
+        # (plain "ticker" is rejected; "v2/ticker" is the working channel).
         payload = {
             "type": "subscribe",
             "payload": {
                 "channels": [
-                    {"name": "ticker", "symbols": symbols},
+                    {"name": _TICKER_CHANNEL, "symbols": symbols},
                 ]
             },
         }
         if self._ws_app is not None:
             self._ws_app.send(json.dumps(payload))
-            logger.info("Subscribed to ticker channel for %d symbol(s).", len(symbols))
+            logger.info("Subscribed to %s channel for %d symbol(s).", _TICKER_CHANNEL, len(symbols))
 
     # -- internal: message parsing --------------------------------------------
 
@@ -190,9 +203,12 @@ class DeltaWebSocketClient:
             return
 
         msg_type = data.get("type")
-        if msg_type != "ticker":
-            # Subscription acks, heartbeats, and other channel types are
-            # ignored here -- this client only cares about ticker snapshots.
+        if msg_type != _TICKER_CHANNEL:
+            # Subscription acks ("subscriptions"), heartbeats, and other
+            # channel types are ignored here -- this client only cares about
+            # ticker snapshots. NOTE: incoming ticker messages carry
+            # "type": "v2/ticker", not "type": "ticker" -- confirmed against
+            # a live testnet connection 2026-08-21 (see module docstring).
             return
 
         snapshot = self._parse_ticker_message(data)
