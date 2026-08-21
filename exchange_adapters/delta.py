@@ -95,7 +95,20 @@ class DeltaAdapter:
         payload = resp.json()
         if not payload.get("success", False):
             raise DeltaAdapterError(f"Delta API GET {url} success=false: {payload}")
-        return payload["result"]
+        result = payload["result"]
+        if result is None:
+            # Delta returns HTTP 200 + success=true + result=null for some
+            # not-found cases (e.g. an invalid instrument id on
+            # /v2/tickers/{id}) rather than a 404 or success=false. Per
+            # architecture.md Section A.1's fail-closed principle, this must
+            # raise clearly here rather than let callers like get_ticker
+            # crash on `None.get(...)` with a confusing AttributeError, or
+            # worse, silently propagate None into a downstream calculation.
+            raise DeltaAdapterError(
+                f"Delta API GET {url} returned success=true but result=null "
+                f"(commonly indicates an invalid/unknown identifier in the request)"
+            )
+        return result
 
     @staticmethod
     def _parse_option_variant(product: dict[str, Any]) -> OptionVariant:
