@@ -32,6 +32,20 @@ distribution or pull live margin requirements -- both are explicitly
 deferred items (Section H: "Margin risk... pulled live" is listed as a
 mitigation for later, not built in Phase 5).
 
+KNOWN GAP FOUND DURING FIRST LIVE RUN (2026-08-21): candidate_pairs can go
+stale within hours, not just days. A short leg with a same-day (D1) expiry
+that was live when matching/run_matcher.py ran can expire and be delisted
+from Delta's ticker endpoint by the time this script runs against it --
+observed directly: instrument 195593 (C-BTC-72200-210826, expiry 12:00 UTC)
+returned `success=true, result=null` from `/v2/tickers/{id}` about 4.5 hours
+after its own expiry. This script now filters those out at load time (see
+`_load_candidates`'s `now` check) instead of letting them surface as a
+confusing per-ticker "fetch failed" warning. The practical implication:
+run matching/run_matcher.py and this script close together in time,
+especially for same_exchange_calendar_spread candidates with short-dated
+D1 short legs -- the gap between match time and price time is itself a
+source of data loss, not just a cosmetic delay.
+
 Usage:
     python -m pricing.run_pricing --underlying BTC
     python -m pricing.run_pricing --underlying BTC --min-confidence 0.8 --limit 50
@@ -131,7 +145,19 @@ def _load_candidates(
     min_confidence: Decimal,
     classification: str | None,
     limit: int | None,
-) -> list[MatchCandidate]:
+    now: datetime | None = None,
+) -> tuple[list[MatchCandidate], int]:
+    """
+    Returns (candidates, skipped_expired_count).
+
+    skipped_expired_count is candidates whose short leg has already passed
+    its expiry_timestamp as of `now` -- these are filtered out here, before
+    any ticker fetch, rather than being discovered one wasted API call at a
+    time. See the module docstring's "KNOWN GAP" note: a short-dated (D1)
+    short leg that was live when matching/run_matcher.py ran can expire and
+    be delisted from Delta's ticker endpoint within hours.
+    """
+    now = now or datetime.now(timezone.utc)
     conn.row_factory = sqlite3.Row
     query = """
         SELECT cp.* FROM candidate_pairs cp
@@ -150,6 +176,7 @@ def _load_candidates(
     rows = conn.execute(query, params).fetchall()
 
     candidates: list[MatchCandidate] = []
+    skipped_expired = 0
     for row in rows:
         short_contract = _load_contract(conn, row["short_exchange"], row["short_instrument_id"])
         long_contract = _load_contract(conn, row["long_exchange"], row["long_instrument_id"])
@@ -161,6 +188,13 @@ def _load_candidates(
                 row["short_exchange"], row["short_instrument_id"], short_contract is not None,
                 row["long_exchange"], row["long_instrument_id"], long_contract is not None,
             )
+            continue
+        if short_contract.expiry_timestamp <= now:
+            logger.debug(
+                "Skipping candidate %s: short leg %s expired at %s (now=%s)",
+                row["pair_id"], short_contract.contract_symbol, short_contract.expiry_timestamp, now,
+            )
+            skipped_expired += 1
             continue
         candidates.append(
             MatchCandidate(
@@ -174,7 +208,7 @@ def _load_candidates(
                 same_exchange=row["short_exchange"] == row["long_exchange"],
             )
         )
-    return candidates
+    return candidates, skipped_expired
 
 
 def _fetch_snapshot(
@@ -276,14 +310,20 @@ def main() -> int:
     conn = sqlite3.connect(DB.sqlite_path)
     conn.execute("PRAGMA foreign_keys = ON;")
 
-    candidates = _load_candidates(
+    candidates, skipped_expired = _load_candidates(
         conn, args.underlying, Decimal(str(args.min_confidence)), args.classification, args.limit
     )
+    if skipped_expired:
+        logger.warning(
+            "%d candidate(s) skipped: short leg already expired since matching/run_matcher.py ran. "
+            "If this number is large, re-run the matcher on fresh instrument data before pricing.",
+            skipped_expired,
+        )
     if not candidates:
         logger.error(
-            "No candidate_pairs found for underlying=%s min_confidence=%.2f classification=%s. "
-            "Has matching/run_matcher.py run yet?",
-            args.underlying, args.min_confidence, args.classification,
+            "No usable candidate_pairs found for underlying=%s min_confidence=%.2f classification=%s "
+            "(%d skipped as already-expired). Has matching/run_matcher.py run recently?",
+            args.underlying, args.min_confidence, args.classification, skipped_expired,
         )
         conn.close()
         return 1
@@ -349,9 +389,9 @@ def main() -> int:
 
     positive_ev = [r for r in results if r.expected_value > 0]
     logger.info(
-        "Result: %d priced, %d skipped (no executable live data), %d skipped (no fee schedule), "
-        "%d of %d priced show positive EV.",
-        len(results), skipped_no_data, skipped_no_fees, len(positive_ev), len(results),
+        "Result: %d priced, %d skipped (already expired), %d skipped (no executable live data), "
+        "%d skipped (no fee schedule), %d of %d priced show positive EV.",
+        len(results), skipped_expired, skipped_no_data, skipped_no_fees, len(positive_ev), len(results),
     )
 
     ranked = sorted(results, key=lambda r: r.expected_value, reverse=True)
