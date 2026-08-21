@@ -175,18 +175,59 @@ class DeltaAdapter:
     def get_option_chain(
         self, underlying: str, expiry: datetime | None = None
     ) -> list[OptionContract]:
-        params: dict[str, Any] = {
-            "contract_types": "call_options,put_options",
-            "underlying_asset_symbols": underlying,
-        }
-        if expiry is not None:
-            params["expiry_date"] = expiry.strftime("%d-%m-%Y")
-        raw_tickers = self._get("/v2/tickers", params=params)
+        """
+        Bug found + fixed during Phase 2 testnet validation (2026-08-21): this
+        originally called GET /v2/tickers with contract_types +
+        underlying_asset_symbols params. That call succeeds and returns real
+        rows, but a ticker row is NOT the same shape as a /v2/products row,
+        and _normalize_product assumes the /v2/products shape:
+
+          - /v2/tickers has no settlement_time or expiry_time field at all
+            (confirmed against a live testnet response -- full key list was
+            ['close', 'contract_type', 'contract_value', 'description',
+            'greeks', 'high', 'leverage', 'low', 'ltp_change_24h',
+            'mark_change_24h', 'mark_high_24h', 'mark_low_24h', 'mark_price',
+            'mark_vol', 'oi', 'oi_change_usd_6h', 'oi_contracts',
+            'oi_reduce_only_mode', 'oi_value', 'oi_value_symbol',
+            'oi_value_usd', 'open', 'price_band', 'product_id',
+            'product_trading_status', 'quotes', 'size', 'sort_priority',
+            'spot_price', 'strike_price', 'symbol', 'tags', 'tick_size',
+            'time', 'timestamp', 'top_tag', 'turnover', 'turnover_symbol',
+            'turnover_usd', 'underlying_asset_symbol', 'volume']).
+            _settlement_timestamp() requires one of those two fields and
+            raises otherwise; _normalize_product catches that and returns
+            None, silently dropping EVERY row. That's why get_option_chain
+            always returned [] even though the underlying testnet data was
+            fine (336 live BTC options existed at the time this was found).
+          - /v2/tickers also flattens underlying_asset into a plain string
+            (underlying_asset_symbol) instead of /v2/products' nested
+            {"symbol": ...} object, so even contracts that got past the
+            settlement-time guard would have had blank underlying/base_asset
+            fields.
+
+        Fix: use /v2/products instead -- the same endpoint and response shape
+        get_instruments() already normalizes correctly -- and filter
+        client-side by underlying, option contract type, and live state.
+        We filter client-side rather than relying on /v2/products' own query
+        params because that filtering behavior isn't confirmed the way
+        /v2/tickers' was; the whole point of this fix is to stop trusting
+        unconfirmed assumptions about this API.
+        """
+        raw_products = self._get("/v2/products")
         contracts: list[OptionContract] = []
-        for ticker in raw_tickers:
-            normalized = self._normalize_product(ticker)
-            if normalized is not None:
-                contracts.append(normalized)
+        for product in raw_products:
+            if product.get("contract_type") not in ("call_options", "put_options"):
+                continue
+            if product.get("state") != "live":
+                continue
+            if product.get("underlying_asset", {}).get("symbol") != underlying:
+                continue
+            normalized = self._normalize_product(product)
+            if normalized is None:
+                continue
+            if expiry is not None and normalized.expiry_timestamp.date() != expiry.date():
+                continue
+            contracts.append(normalized)
         return contracts
 
     def get_orderbook(self, instrument_id: str, depth: int = 5) -> OrderBookSnapshot:
