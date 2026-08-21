@@ -32,6 +32,23 @@ Settlement mechanics baked into normalization here reflect what's documented:
   - Options are European, cash-settled.
   - Settlement fee is waived entirely for contracts expiring OTM.
 See docs/architecture.md Section 0 and Section C for why this matters.
+
+BUG FOUND + FIXED during Phase 5 live-run validation (2026-08-21): `_get()`
+had no retry logic and no handling of `requests` network-level exceptions
+(timeouts, connection resets). On a single call, or the 20-candidate smoke
+test, this never surfaced. On the real Phase 5 run against all 1,504
+candidates -- several hundred sequential `/v2/tickers/{id}` calls over
+multiple minutes -- a single transient read timeout on the shared Delta
+testnet host (confirmed reproducible: same host, same endpoint, worked fine
+moments earlier via curl and via the smoke test) raised a raw
+`requests.exceptions.ReadTimeout` that was never caught anywhere, killing
+the entire run and losing all progress, since `pricing/run_pricing.py`
+persists to `signals` only once at the very end, not incrementally. Fixed
+by retrying transient network errors with backoff and wrapping the final
+failure as `DeltaAdapterError` -- which `run_pricing.py::_fetch_snapshot`
+already catches and treats as a per-candidate skip, so no caller-side
+change was needed once this adapter behaves the way its own error-handling
+contract already implied it should.
 """
 
 from __future__ import annotations
@@ -43,7 +60,7 @@ from typing import Any
 
 import requests
 
-from config.settings import DELTA
+from config.settings import COLLECTOR, DELTA
 from exchange_adapters.base import (
     Balance,
     OrderBookSnapshot,
@@ -64,6 +81,13 @@ from normalization.schemas import (
 )
 
 _DELTA_SETTLEMENT_FORMULA = "30min_twap_index"
+
+# Per-request timeout, in seconds. Bumped from the original 10 -> 20 based on
+# the same live-run finding above: a single successful call can involve a
+# TLS renegotiation and a shared/rate-limited testnet host, and 10s left too
+# little margin for legitimate (if slow) responses, not just genuinely dead
+# connections.
+_REQUEST_TIMEOUT_SEC = 20
 
 
 class DeltaAdapterError(RuntimeError):
@@ -86,8 +110,43 @@ class DeltaAdapter:
     # -- internal -----------------------------------------------------------
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """
+        Retries transient network-level failures (timeouts, connection
+        errors) with exponential backoff, per config/settings.py's
+        CollectorConfig.max_retries_per_call / retry_backoff_base_sec --
+        the same knobs the Phase 2 collectors already use for the same
+        "shared testnet host, be resilient but not infinite" reasoning.
+        A non-2xx HTTP response or a success=false/result=null payload is
+        NOT retried -- those are the API telling us something deterministic
+        (bad request, invalid id), not a transient blip, so retrying them
+        would just waste time before raising the same error.
+        """
         url = f"{self._base_url}{path}"
-        resp = self._session.get(url, params=params, timeout=10)
+        max_attempts = max(COLLECTOR.max_retries_per_call, 1)
+        last_network_exc: requests.exceptions.RequestException | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self._session.get(url, params=params, timeout=_REQUEST_TIMEOUT_SEC)
+                break
+            except requests.exceptions.RequestException as exc:
+                last_network_exc = exc
+                if attempt == max_attempts:
+                    raise DeltaAdapterError(
+                        f"Delta API GET {url} failed after {attempt} attempt(s) "
+                        f"due to a network-level error: {exc}"
+                    ) from exc
+                backoff = COLLECTOR.retry_backoff_base_sec * (2 ** (attempt - 1))
+                time.sleep(backoff)
+        else:
+            # Unreachable in practice (the loop always either breaks or
+            # raises), but keeps the type checker honest and fails loudly
+            # rather than falling through with `resp` undefined.
+            raise DeltaAdapterError(
+                f"Delta API GET {url}: exhausted retries with no response and no exception "
+                f"captured (last_network_exc={last_network_exc})"
+            )
+
         if resp.status_code != 200:
             raise DeltaAdapterError(
                 f"Delta API GET {url} returned {resp.status_code}: {resp.text[:500]}"
