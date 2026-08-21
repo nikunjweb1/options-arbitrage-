@@ -1,7 +1,9 @@
 # Cross-Exchange Options Expiry/IV Arbitrage System
-## Architecture, Research Findings & MVP Plan — v1 (Pre-Code)
+## Architecture, Research Findings & Roadmap — v2 (Fast-Track)
 
-**Status:** Research + architecture only. No code has been written. Live trading remains disabled by design throughout this document.
+**Status:** Phase 2 (data collection) and Phase 3 (contract matching) complete, validated against real Delta testnet data. Live trading remains disabled by design throughout this document.
+
+**v2 revision note:** After Phase 3 produced real results (374 live BTC contracts, 1,504 structurally valid candidate pairs found, 68,247 correctly rejected), the project owner asked to move as fast as possible to a real answer on whether this strategy has an edge, and to cut anything that isn't load-bearing. This revision compresses Phases 5-10 into leaner, faster versions. **What did not change:** backtesting, paper trading, and the risk/kill-switch layer are still in the plan — they're the only things standing between "we think this works" and finding out with real money that it doesn't, on a strategy whose "low risk" premise is exactly the thing this project exists to verify rather than assume. What changed is scope and depth, not whether these steps happen. See Section L for the compressed plan and the honest trade-offs it makes.
 
 ---
 
@@ -11,19 +13,15 @@ Before any design work, I researched the exchanges you named against their own d
 
 **Headline finding: the numeric example in the brief (Exchange A expires 1:30 PM, Exchange B expires 5:30 PM, same day) does not match Delta Exchange India's documented behavior.** Delta's own guide states plainly that *all* options contracts — daily, weekly, monthly, quarterly — settle at **5:30 PM IST**, computed from a 30-minute TWAP of the index price at that fixed clock time. There is no 1:30 PM settlement bucket on Delta. "D1," "D2" and weekly maturities differ by *which day* they settle, not by *what time of day*. So if the video's edge is real, it isn't "Delta's early option vs. Delta's late option" — it has to come from somewhere else entirely: a genuine intraday settlement-time difference on **another** exchange, a calendar-day (not intraday) version of the trade, or it's an artifact that disappears once you price off real bid/ask instead of a chart.
 
-This doesn't kill the project. It means **Phase 1's real deliverable is figuring out which exchanges, if any, actually have differing intraday settlement clocks**, before we build anything around the specific 1:30/5:30 example. I've built the architecture to be agnostic to this — the matching engine's whole job is to *discover* real expiry-time deltas rather than assume one.
+This doesn't kill the project. It means **Phase 1's real deliverable is figuring out which exchanges, if any, actually have differing intraday settlement clocks**, before we build anything around the specific 1:30/5:30 example. The architecture is built to be agnostic to this — the matching engine's whole job is to *discover* real expiry-time deltas rather than assume one, and Phase 3's real run confirmed same-exchange calendar-spread structure exists on Delta (433 exact-strike pairs found) — which is evidence there's *something* to analyze, not evidence of profit.
 
 **Exchange readiness (researched, not assumed):**
 
-| Exchange | Public options API | Settlement mechanics documented? | Verdict for Phase 1 |
+| Exchange | Public options API | Settlement mechanics documented? | Verdict |
 |---|---|---|---|
-| **Delta Exchange India** | Yes — full public REST v2 (`api.india.delta.exchange`) + WebSocket (`socket.india.delta.exchange`), testnet, official Python/Node SDKs, CCXT support | Yes, precisely: European, cash-settled, 30-min TWAP of index at strike, fixed 5:30 PM IST settlement clock for every contract | **Build against this first.** Everything else is secondary until this is proven or disproven. |
-| **CoinSwitch PRO** | Options API listed as "**available on request**," separate from the fully self-serve Spot/Futures/HFT surfaces | Marketing language only ("real-time settlement," "daily expiries," "24x7," USDT-settled, micro lot sizes) — no settlement-time or settlement-formula documentation found | **Blocked.** Must request options API docs directly from CoinSwitch before writing an adapter. Do not assume "real-time settlement" means anything specific — it could mean continuous settlement or just a fast daily cycle. |
-| **Shark Exchange** | No public options API documentation found. Primarily an INR-native perpetual futures platform; third-party comparison articles say options were "added," but no official endpoint spec surfaced | Unknown | **Not viable for Phase 1.** Revisit only if they publish real docs, or drop from initial scope. |
-
-**Implication for the roadmap:** Phase 1 is not "confirm three exchanges work." It's "confirm Delta's mechanics precisely, and determine — by directly asking CoinSwitch for their options API spec — whether a real cross-exchange settlement-time gap exists at all." Everything downstream (matching, EV model, backtest) depends on this answer. I'd rather tell you that now than build a scanner around a gap that turns out not to exist.
-
-None of this means abandon the project — a real cross-exchange calendar/expiry-structure difference is a legitimate and well-known class of trade (it's essentially a cross-venue calendar spread). It means we verify the mechanism before writing the strategy math around your specific example.
+| **Delta Exchange India** | Yes — full public REST v2 (`api.india.delta.exchange`) + WebSocket (`socket.india.delta.exchange`), testnet, official Python/Node SDKs, CCXT support | Yes, precisely: European, cash-settled, 30-min TWAP of index at strike, fixed 5:30 PM IST settlement clock for every contract | **Primary exchange, in active use.** Phase 2/3 built and validated against this. |
+| **CoinSwitch PRO** | Options API listed as "**available on request**," separate from the fully self-serve Spot/Futures/HFT surfaces | Marketing language only ("real-time settlement," "daily expiries," "24x7," USDT-settled, micro lot sizes) — no settlement-time or settlement-formula documentation found | **Still blocked.** Deferred under the fast-track plan (Section L) — not worth chasing docs for until Delta-only proves or disproves an edge. |
+| **Shark Exchange** | No public options API documentation found. | Unknown | **Dropped from v1/v2 scope.** Revisit only if they publish real docs. |
 
 ---
 
@@ -31,7 +29,7 @@ None of this means abandon the project — a real cross-exchange calendar/expiry
 
 ### A.1 Design philosophy
 
-- **Data → Matching → Math → Scan → Backtest → Paper → Execute → Dashboard**, strictly in that order. No component downstream is trusted until the component upstream is validated against real data.
+- **Data → Matching → Math → Scan → Backtest → Paper → Execute → Dashboard**, strictly in that order. No component downstream is trusted until the component upstream is validated against real data. (Section L compresses *how much* validation happens at each stage, not the order.)
 - **Adapter-isolated.** Every exchange-specific quirk (symbol format, settlement time, fee schedule, contract multiplier) lives in one adapter file. Nothing else in the system is allowed to hardcode an exchange assumption.
 - **Executable-price-only.** Anything that touches a P&L number uses top-of-book bid/ask (or deeper book if size requires it), never mark price, last price, or index price, for entry/exit decisioning. Mark/index price is used only for margin and risk calculations where the exchange itself uses it that way.
 - **Fail-closed.** Any missing data, stale quote, or unverified assumption blocks the opportunity from being scored positively — it does not default to "assume it's fine."
@@ -42,7 +40,7 @@ None of this means abandon the project — a real cross-exchange calendar/expiry
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                         EXCHANGE ADAPTERS                            │
-│   DeltaAdapter   │   CoinSwitchAdapter (blocked)  │  [future adapters]│
+│   DeltaAdapter (REST + WS, DONE) │ CoinSwitchAdapter (deferred)      │
 │   implements: get_instruments, get_option_chain, get_orderbook,      │
 │   get_ticker, get_positions, get_balance, place_order, cancel_order, │
 │   modify_order, get_order_status, get_fees, get_contract_spec        │
@@ -50,57 +48,50 @@ None of this means abandon the project — a real cross-exchange calendar/expiry
                 │  raw exchange payloads
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                      NORMALIZATION LAYER                             │
-│  raw JSON → OptionContract, OrderBookSnapshot, TickerSnapshot        │
-│  (schemas in Section E). One normalizer per adapter; output schema   │
-│  is exchange-agnostic.                                                │
+│                 NORMALIZATION LAYER (DONE)                           │
+│  raw JSON → OptionContract, MarketSnapshot                            │
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                      TIME-SERIES STORE (DB)                          │
-│  instruments, market_data (tick-level), signals, trades              │
-│  (schema in Section F)                                                │
+│                      SQLITE STORE (DONE)                             │
+│  instruments, market_data (tick-level), candidate_pairs, signals,     │
+│  trades                                                                │
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                      CONTRACT MATCHING ENGINE                        │
-│  same underlying + option type + compatible strike/multiplier/        │
-│  settlement currency/settlement method → candidate pair               │
-│  + confidence score (exact strike vs. interpolated vs. rejected)      │
+│                 CONTRACT MATCHING ENGINE (DONE)                      │
+│  1,504 candidate pairs found and persisted from real Delta data       │
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                 PRICING / EV / MONTE CARLO ENGINE                    │
-│  Black-Scholes / Black-76, IV surface, remaining-value distribution,  │
-│  probability of profit, VaR/ES                                        │
+│           PRICING / EV / MONTE CARLO ENGINE  ← BUILDING NEXT         │
+│  lean version per Section L — real bid/ask, real fees, real EV        │
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       OPPORTUNITY SCANNER                             │
-│  continuous scan → executable net entry → classify → score 0-100      │
+│  continuous scan → executable net entry → classify → score            │
 └───────────────┬────────────────────────────────────────────────────-┘
         ┌───────┴────────┐
         ▼                ▼
 ┌───────────────┐  ┌──────────────────────────────────────────────────┐
-│  BACKTESTER    │  │              ALERTING / DASHBOARD                 │
-│  (offline)     │  │  Telegram / Discord / Email / web UI              │
-└───────────────┘  └──────────────────┬───────────────────────────────┘
-                                       ▼
-                    ┌──────────────────────────────────────────────────┐
-                    │        PAPER TRADING ENGINE (mirrors live)        │
-                    └──────────────────┬───────────────────────────────┘
-                                       ▼
-                    ┌──────────────────────────────────────────────────┐
-                    │   LEG EXECUTION ENGINE (disabled: LIVE=False)     │
-                    │   validate → lock → leg 1 → confirm → leg 2 →     │
-                    │   confirm → monitor → exit                        │
-                    └──────────────────┬───────────────────────────────┘
-                                       ▼
-                    ┌──────────────────────────────────────────────────┐
-                    │   RISK ENGINE + KILL SWITCH (cross-cutting)       │
-                    │   hard limits checked before every state          │
-                    │   transition in scanner, paper, and live paths    │
-                    └──────────────────────────────────────────────────┘
+│  LEAN          │  │              DASHBOARD (deferred)                 │
+│  BACKTESTER    │  │  built only after an edge is confirmed             │
+└───────────────┘  └──────────────────────────────────────────────────┘
+        ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│        SHORT PAPER TRADING WINDOW (mirrors live, simulated fills)     │
+└──────────────────┬───────────────────────────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│   LEG EXECUTION ENGINE (built, disabled: LIVE=False)                  │
+│   validate → lock → leg 1 → confirm → leg 2 → confirm → monitor       │
+└──────────────────┬───────────────────────────────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│   RISK ENGINE + KILL SWITCH (built alongside execution engine,        │
+│   not deferred — see Section L)                                       │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### A.3 Exchange adapter interface (contract, not implementation)
@@ -121,56 +112,49 @@ class ExchangeAdapter(Protocol):
     def get_contract_specification(self, instrument_id: str) -> ContractSpec: ...
 ```
 
-Every adapter must be validated against **testnet first** (Delta provides one: `cdn-ind.testnet.deltaex.org`) before touching production keys. See `exchange_adapters/base.py` for the real Python Protocol and `exchange_adapters/delta.py` for the Delta implementation.
+See `exchange_adapters/base.py` (Protocol), `exchange_adapters/delta.py` (REST, done), `exchange_adapters/delta_ws.py` (WebSocket, done).
 
 ---
 
 ## B. Exchange API comparison (as documented, not assumed)
 
-| Item | Delta Exchange India | CoinSwitch PRO | Shark Exchange |
-|---|---|---|---|
-| REST base URL | `https://api.india.delta.exchange` (v2; v1 deprecated) | Not publicly documented for options | Not publicly documented |
-| WebSocket | `wss://socket.india.delta.exchange` | Unknown for options | Unknown |
-| Testnet | Yes — `cdn-ind.testnet.deltaex.org` | Unknown | Mentioned generically, unverified for options |
-| Official SDKs | Python, Node.js, CCXT integration | Multi-language client for Spot/Futures/HFT; options "available on request" | Unknown |
-| Auth | API key + HMAC signature + timestamp headers | Single signature scheme across their 4 API surfaces (per their docs) | Unknown |
-| Options instrument type | European, cash-settled, BTC & ETH, D1/D2/weekly/monthly maturities | USDT-settled, described as "daily expiries," 24x7 | Recently added per third-party reviews; no spec found |
-| Settlement time | **Fixed at 5:30 PM IST for every contract** | Unclear — "real-time settlement" is undefined | Unknown |
-| Settlement price formula | `max(30-min TWAP index − strike, 0)` for calls, mirrored for puts | Not documented publicly | Unknown |
-| Rate limits | 500 operations/sec/product (documented); higher limits for registered market makers | Unknown | Unknown |
-| Fees | Maker/taker on notional; options fee capped at 7.5–12.5% of premium depending on region (India vs. Global pages differ slightly — needs reconciling against your actual account fee schedule); **zero settlement fee on contracts expiring OTM**; 18% GST added on India accounts | Marketed as "lowest fees," specifics not found | Fee cap of 5% of premium claimed by a third-party comparison, not an official source |
-| Margin | Documented isolated/cross/portfolio margin formulas, TWAP/mark-based IM calculations | Not documented publicly | Not documented publicly |
+| Item | Delta Exchange India | CoinSwitch PRO |
+|---|---|---|
+| REST base URL | `https://api.india.delta.exchange` (v2) | Not publicly documented for options |
+| WebSocket | `wss://socket.india.delta.exchange` | Unknown for options |
+| Testnet | Yes — `cdn-ind.testnet.deltaex.org` | Unknown |
+| Settlement time | **Fixed at 5:30 PM IST for every contract** | Unclear |
+| Settlement price formula | `max(30-min TWAP index − strike, 0)` for calls, mirrored for puts | Not documented publicly |
+| Fees | Maker/taker on notional; capped at 7.5–12.5% of premium; **zero settlement fee on OTM**; 18% GST (India accounts) | Not documented publicly |
 
-**Action required from you before Phase 1 can close:** request CoinSwitch's options API documentation directly (their site explicitly routes this as "available on request" rather than self-serve) and get Shark Exchange's official API docs if you want to keep them in scope. Do not fabricate specs for either.
+CoinSwitch and Shark remain deferred per Section L — not pursued further until Delta-only data answers the core question.
 
 ---
 
 ## C. Contract specification comparison
 
-This is flagged as **the single biggest source of false-positive "arbitrage"** if done sloppily.
+The single biggest source of false-positive "arbitrage" if done sloppily, and the checklist `matching/engine.py` actually implements:
 
-1. **Settlement clock.** Delta = fixed 5:30 PM IST, always. Any exchange pair must have its settlement times pulled from live instrument metadata, never hardcoded from an example.
-2. **Settlement price basis.** Delta uses a 30-minute TWAP of its own index price. If CoinSwitch uses last traded price, its own index, or a different TWAP window, two "same strike" options can have materially different payoff distributions even at an identical strike and identical nominal expiry date — this alone can manufacture a fake edge.
-3. **Settlement currency / margin currency.** Confirm whether both legs settle in USDT, or one in USDT and the other with an INR overlay — an unhedged FX/stablecoin-basis difference can look like an arbitrage margin and isn't.
-4. **Contract multiplier & lot size.** Never assume "1 contract = 1 contract" across exchanges. Pull from `get_contract_specification()` every time, and if multipliers differ, size the pair to notional-equivalent, not contract-count-equivalent.
-5. **European vs. any early-exercise or knockout variant.** Delta explicitly offers exotic "Turbo" options with knockout barriers alongside vanilla European options — a matching engine that isn't checking `option_variant` could pair a vanilla contract against a barrier contract that merely has a similar-looking symbol.
-6. **Index construction.** "BTC index price" is not one universal number — each exchange computes its own index from its own basket of spot venues. A spread between two "identical" options can be entirely explained by a spread between the two exchanges' index calculations.
-7. **Fee structure asymmetry.** GST (18%, India-specific) plus a premium-based fee cap on Delta vs. an unknown CoinSwitch fee schedule means identical quoted spreads can have very different net economics per leg.
+1. **Settlement clock** — pulled from live instrument metadata, never hardcoded.
+2. **Settlement price basis** — TWAP vs. last-price vs. different index construction can manufacture a fake edge even at identical strike/expiry.
+3. **Settlement currency / margin currency** — an unhedged FX/stablecoin-basis difference can look like edge and isn't.
+4. **Contract multiplier & lot size** — size to notional-equivalent, never contract-count-equivalent.
+5. **European vs. knockout/Turbo variant** — never paired even if strike/underlying/type match.
+6. **Index construction** — each exchange computes its own index; a spread can be explained entirely by index-construction differences.
+7. **Fee structure asymmetry** — GST + premium-based fee caps mean identical quoted spreads can have very different net economics.
 
-The contract matching engine must treat every one of these seven items as a required, checked field — not a display-name heuristic.
+All seven are enforced as required, checked fields in `matching/engine.py` — not display-name heuristics. Confirmed working against 374 real Delta contracts (Phase 3 run).
 
 ---
 
 ## D. Mathematical strategy definition
 
-### D.1 What we're actually trying to measure
+*(Unchanged from v1 — this is the math the lean EV engine in Section L implements, just without the full historical-IV-distribution modeling deferred to a later pass.)*
 
-Define:
-- `t0` = now
-- `T1` = earlier expiry (short leg), `T2` = later expiry (long leg), `T2 > T1`
-- `K` = strike (or `K1`, `K2` if strikes differ and interpolation is used)
-- `S_t` = underlying price at time `t`
-- `σ1, σ2` = implied vol relevant to each leg's pricing model
+### D.1 Definitions
+
+- `t0` = now; `T1` = earlier expiry (short leg); `T2` = later expiry (long leg), `T2 > T1`
+- `K` = strike; `S_t` = underlying price at time `t`; `σ` = implied vol
 - `B_short`, `A_long` = executable bid (short leg) and ask (long leg) *right now*
 
 ### D.2 Entry economics (must use executable quotes, never mark)
@@ -180,154 +164,118 @@ Gross entry credit = B_short − A_long
 Net entry cost = Gross entry credit
                  − trading_fees(short) − trading_fees(long)
                  − expected_slippage(short, size) − expected_slippage(long, size)
-                 − funding/carry costs where applicable
-                 − transfer costs if capital must move between venues
 ```
 
-### D.3 Expected value of the long leg at T1 (the crux of the whole strategy)
-
-At `t = T1`, the short leg settles. The long leg does **not** expire; it has `(T2 − T1)` of remaining life. Its value is a *distribution*, not a point estimate:
+### D.3 Expected value of the long leg at T1
 
 ```
 V_long(T1) = OptionPricingModel(
-    S = S_T1,                     # simulated/observed underlying at T1
-    K = K2,
-    time_to_expiry = T2 − T1,
-    sigma = sigma_effective_at_T1,   # NOT today's sigma — vol can and does change
+    S = S_T1, K = K2, time_to_expiry = T2 − T1,
+    sigma = sigma_effective_at_T1,   # lean version: today's IV +/- a simple shock band, not a full historical term-structure model
     r = risk_free_rate_or_funding_rate,
-    model = BlackScholes | Black76   # per contract_spec.settlement_method
+    model = BlackScholes
 )
 ```
 
-Two failure modes to explicitly guard against:
-1. **Using today's IV to price the option at T1.** IV is not static. The model must draw `sigma_effective_at_T1` from a distribution informed by historical IV term-structure behavior, not hold it constant.
-2. **Assuming linear time decay.** The EV must come from actually repricing the option under the Monte Carlo path, not from a rule of thumb.
+**Lean-plan simplification (see Section L.2):** the full v1 plan called for drawing `sigma_effective_at_T1` from a distribution fit to historical IV term-structure behavior. The lean version uses today's observed IV plus a small number of shock scenarios (e.g. -30%/0/+30%) instead of a fitted distribution — faster to build, less statistically rigorous, and explicitly labeled as such in every output so it's never mistaken for the fuller model.
 
 ### D.4 P&L per simulated path
 
 ```
-Short_payoff(T1) = settlement_formula(S_T1, K1)      # per exchange's own documented formula
-P&L_path = Net_entry_cost
-           − Short_payoff(T1)                         # cost to close/settle the short
-           + V_long(T1)                                # mark-to-model value of long leg at T1
-           − exit_fees(long) − exit_slippage(long)
+Short_payoff(T1) = settlement_formula(S_T1, K1)
+P&L_path = Net_entry_cost − Short_payoff(T1) + V_long(T1) − exit_fees(long) − exit_slippage(long)
 ```
 
-### D.5 Classification logic
+### D.5 Classification logic — implemented in `matching/engine.py`, confirmed working
 
-- **Same strike, same underlying, differing settlement times, no synthetic/parity relationship involved** → *Cross-exchange expiry arbitrage* or, if the time gap is actually a calendar-day difference rather than intraday, **Cross-exchange calendar spread**.
-- **Strikes differ and a delta/gamma-neutral relationship is being modeled between them** → *Options relative-value arbitrage*.
-- **Position constructed from call+put+underlying replicating a synthetic forward, compared cross-exchange** → *Synthetic arbitrage* or *Put-call parity arbitrage*.
-- **Four-leg box (two calls, two puts, two strikes) compared cross-exchange** → *Box arbitrage*, flagged for stricter tolerance since a "true" box should have near-zero risk *if and only if* settlement mechanics genuinely match.
-- **Spread persists beyond what fees/slippage explain and no structural difference accounts for it** → *IV mispricing* / *Cross-exchange option mispricing*.
-
-The scanner never defaults to "IV arbitrage" as a label; it must be earned by ruling out the structural explanations first.
+- Same strike, same underlying, same exchange → **Same-exchange calendar spread** (433 found in Phase 3 run)
+- Different (in-tolerance) strikes → **Options relative-value arbitrage** (1,071 found)
+- Same strike, cross-exchange, same calendar date → **Cross-exchange expiry arbitrage** (the video's actual premise — not yet tested, blocked on a second exchange)
+- Same strike, cross-exchange, different calendar date → **Cross-exchange calendar spread**
 
 ---
 
 ## E. Data requirements
 
-See `normalization/schemas.py` for the real dataclasses (`OptionContract`, `MarketSnapshot`).
-
-### E.3 Collection cadence
-
-- Order book top-of-book + Greeks: WebSocket push where available (Delta supports this); fallback to REST polling at a rate under the documented 500 ops/sec/product ceiling.
-- Full instrument list refresh: on a timer (new strikes/maturities get added intraday per Delta's own "strike discovery every 5 minutes" rule) — poll `get_instruments()` at least every 5 minutes.
-- Historical tick storage: append-only, never overwritten, timestamped at ingestion time in addition to exchange-reported time (to detect clock skew).
+Implemented in `normalization/schemas.py`. Collection is WebSocket-driven (`collectors/realtime_collector.py`), sub-1-second flush to SQLite, REST fallback for instrument specs. Both done and in use.
 
 ---
 
 ## F. Database schema
 
-Development phase: **SQLite** for OLTP-style state (instruments, trades, positions) + **DuckDB** for analytical/backtest workloads. Migrate to TimescaleDB/ClickHouse only when tick volume or concurrent-writer load actually requires it. See `db/schema.sql` for the real schema.
+SQLite, implemented in `db/schema.sql`. `instruments`, `market_data`, `candidate_pairs` (populated, 1,504 rows), `signals`, `trades` tables all exist.
 
 ---
 
-## G. Backtesting methodology
+## G. Backtesting methodology — LEAN VERSION (see Section L for full rationale)
 
-### G.1 Non-negotiables
+### G.1 Non-negotiables (unchanged — these are not being cut)
 
-1. **Historical bid/ask, not last price, if the data exists.** Short leg fills against historical bid, long leg against historical ask.
-2. **No synthetic/manufactured historical data.** If order-book history isn't available for a period, that period is excluded from the backtest and the exclusion is reported.
-3. **Fees and settlement rules must match the documented formulas per exchange per period** — including the "OTM = zero settlement fee" rule on Delta.
-4. **Simulate legging failure.** A meaningful fraction of backtested trades must assume the second leg fails to fill at the assumed price and measure the resulting P&L.
+1. Historical bid/ask, not last price, if the data exists.
+2. No synthetic/manufactured historical data — gaps are reported, not filled in.
+3. Fees and settlement rules match documented formulas, including OTM-zero-settlement-fee.
+4. Legging failure is simulated for a meaningful fraction of trades, not ignored.
 
-### G.2 Test matrix
+### G.2 Lean test matrix (compressed from v1's full matrix)
 
-- Windows: 30 / 90 / 180 / 365 days (independently reported).
-- Segmentation: by underlying (BTC, ETH), by expiry-gap bucket, by realized-vol regime, by strike moneyness bucket.
-- Position sizing variants: fixed-size, and size scaled to available liquidity.
-- Entry threshold sweep: 0.5% to 5% of notional, to check overfitting sensitivity.
+- **One window**, sized to whatever historical bid/ask Delta's API actually exposes — not the v1 plan's independent 30/90/180/365-day reports.
+- **One underlying** (BTC), not segmented by moneyness/vol-regime buckets in the first pass.
+- **One entry threshold**, not a 0.5%-5% sweep.
+- If this lean pass shows no edge, the answer is "no edge, stop here" — no reason to build the fuller matrix. If it shows a positive signal, *then* the fuller v1 matrix (segmentation, threshold sweep, walk-forward) becomes worth the time, not before.
 
-### G.3 Validation discipline
+### G.3 What's explicitly deferred, not removed
 
-- **In-sample** on the earliest window only.
-- **Out-of-sample** on later, untouched windows.
-- **Walk-forward**: re-estimate parameters on a rolling basis.
-- **Stress scenarios**: ±5%/±10% BTC moves at T1, IV −50%/+100% shocks, liquidity collapse, one-leg-fails-completely, API downtime during legging.
+In-sample/out-of-sample split, walk-forward re-estimation, and full stress-scenario suite (±5%/±10% BTC moves, IV shocks, liquidity collapse) — all still in the plan, just after a lean pass justifies the additional time. See Section L.
 
 ---
 
-## H. Risk model
+## H. Risk model — NOT COMPRESSED
 
 | Risk | Where it's measured | Where it's mitigated |
 |---|---|---|
-| Market risk | Monte Carlo P&L distribution (D.4) | Position sizing, `MAX_UNDERLYING_EXPOSURE` |
-| IV risk | `sigma_effective_at_T1` drawn from a distribution | Score penalizes high IV-uncertainty candidates |
+| Market risk | Monte Carlo/shock-scenario P&L distribution (D.4) | Position sizing, `MAX_UNDERLYING_EXPOSURE` |
+| IV risk | Shock-band repricing at T1 (lean D.3) | Score penalizes high IV-uncertainty candidates |
 | Liquidity risk | Book depth vs. intended size at scan time | `MIN_LIQUIDITY` hard limit |
 | Slippage risk | Empirical slippage tracked per trade | `MAX_SLIPPAGE` hard limit |
 | Legging risk | Backtest legging-failure simulation | `MAX_LEGGING_TIME`; hedge/cancel-first-leg fallback |
 | Exchange/API risk | Health-check heartbeats per adapter | Kill switch on repeated API errors |
-| Settlement risk | Matching engine settlement check (Section C) | Reject pairs with incompatible settlement mechanics |
+| Settlement risk | Matching engine settlement check (Section C) — **live and enforced today** | Reject pairs with incompatible settlement mechanics |
 | Contract-spec risk | `get_contract_specification()` diffed on every match | Match confidence downgraded on mismatch |
 | Margin risk | Margin requirement pulled live | `MAX_MARGIN_PER_TRADE` |
 | Liquidation risk | Position monitor tracks margin ratio | Auto-reduce/alert before exchange liquidation threshold |
 | Transfer/withdrawal risk | Capital assumed pre-funded on both exchanges | Capital allocation planned, never dynamically moved mid-trade |
 
----
-
-## I. Implementation roadmap
-
-**Phase 1 — Research (current phase).**
-- [ ] Obtain CoinSwitch options API documentation directly from CoinSwitch.
-- [ ] Decide whether to pursue Shark Exchange or drop it for v1.
-- [ ] Confirm empirically whether any documented mechanism creates an intraday settlement gap anywhere in Delta's product suite.
-- Exit criteria: written, sourced answers to the 18 research questions, for at least two exchanges.
-
-**Phase 2 — Market-data collectors (current build target).** Delta adapter first. No trading logic. Output: contracts + market data landing in the DB.
-- Exit criteria: 24h of continuous, gap-free Delta options + underlying data captured and queryable.
-
-**Phase 3 — Contract matcher.** Self-matching Delta's own D1 vs D2 vs weekly chains first.
-- Exit criteria: matcher correctly rejects deliberately-mismatched fixtures and accepts genuine matches, in a test suite.
-
-**Phase 4 — Scanner (no orders).** Real-time candidate detection + executable entry-cost calculation.
-- Exit criteria: a week of live-logged signals with no false "opportunity" traceable to a structural artifact.
-
-**Phase 5 — Pricing/EV/Monte Carlo engine.**
-- Exit criteria: EV estimates directionally consistent with what actually happened to matched pairs historically.
-
-**Phase 6 — Backtester.**
-- Exit criteria: a full backtest report for whatever real candidate pairs Phases 3-5 surfaced.
-
-**Phase 7 — Paper trading.** Full system, simulated fills only.
-
-**Phase 8 — Execution engine.** `LIVE_TRADING = FALSE` hardcoded default.
-
-**Phase 9 — Risk management + kill switch.** Enforced pre-trade checks, not advisory logging.
-
-**Phase 10 — Live trading**, enabled only after explicit, separate approval, and only after a positive, out-of-sample, stress-tested, cost-inclusive edge is demonstrated.
+This table is unchanged from v1. Per the fast-track discussion: risk limits and the kill switch are cheap to build (hours, not phase-length) and are what stops a bad trade from becoming a large loss — they are built alongside the execution engine, not deferred to "later."
 
 ---
 
-## J. MVP: the smallest thing that tells us if there's an edge
+## I. Implementation roadmap — STATUS AS OF v2
 
-1. Delta adapter, collecting full options chain + underlying index continuously.
-2. Self-matching engine applied *within Delta first* — D1 vs D2 vs weekly maturities against each other.
-3. Executable-spread calculator (D.2) on that self-matched data.
-4. Monte Carlo EV model (D.3-D.4) using Black-Scholes off Delta's own reported IV.
-5. Backtest (Section G) over whatever historical window Delta's API exposes.
+**Phase 1 — Research.** ✅ Done. Exchange mechanics confirmed against real docs (Section 0/B).
 
-This answers one question cheaply: does Delta's own documented calendar structure produce a real, cost-inclusive, executable edge on its own — independent of whether CoinSwitch ever gives us API access?
+**Phase 2 — Market-data collectors.** ✅ Done, per project owner confirmation. REST + WebSocket adapters, both collectors, SQLite persistence all built and in use.
+
+**Phase 3 — Contract matcher.** ✅ Done. Real run against 374 live Delta contracts: 1,504 candidates found (433 exact same-exchange calendar spreads, 1,071 relative-value), 68,247 correctly rejected. Persisted to `candidate_pairs`.
+
+**Phase 5 — Pricing/EV engine.** 🔨 Building next, lean version (Section D.3 simplification, Section L.2).
+- Exit criteria (lean): EV, net-of-fees profit, and a probability-of-profit estimate computed for all 1,504 real candidates, using real bid/ask pulled live, not backfilled.
+
+**Phase 6 — Lean backtester.** Next after Phase 5. Per Section G.2.
+- Exit criteria (lean): one honest report, whatever window the data supports, explicitly labeled "lean pass" — a clear go/no-go signal on whether to invest in the fuller v1 backtest matrix.
+
+**Phase 7 — Short paper trading window.** Sized to observed signal frequency from Phase 5/6 (Section L.3), not a fixed multi-week duration.
+
+**Phase 8 — Execution engine + Phase 9 — Risk/kill switch.** Built together, not sequentially deferred (Section L.4). `LIVE_TRADING = FALSE` hardcoded regardless.
+
+**Phase 10 — Live trading.** Enabled only after explicit, separate approval, and only if the lean backtest + paper trading both show a real, cost-inclusive, positive edge. If they don't, we stop here and say so — the fast-track plan changes how quickly we find that out, not whether we're honest about the answer.
+
+**Explicitly deferred (not cancelled):** full v1 backtest matrix (multi-window, segmented, threshold-swept, walk-forward, full stress suite), dashboard, alerting, CoinSwitch/Shark adapters. These come back into scope only if the lean pass shows something worth the additional rigor.
+
+---
+
+## J. MVP — superseded by real results
+
+The v1 MVP question ("does Delta's own calendar structure produce candidates at all?") is answered: yes, 433 exact-strike same-exchange calendar-spread candidates exist structurally. The next question — "do any of them have positive expected value after real costs?" — is what Phase 5 (lean) answers next.
 
 ---
 
@@ -335,35 +283,58 @@ This answers one question cheaply: does Delta's own documented calendar structur
 
 | Project | License | Verdict |
 |---|---|---|
-| **Hummingbot** (`hummingbot/hummingbot`) | Apache 2.0 | Reuse the connector architecture pattern (`ExchangeAdapter` alignment). No native options connector category found — options logic is still ours to build. |
-| **put-call-arb** (`lubintan/put-call-arb`) | None found (all rights reserved by default) | Study the published methodology only; do not copy `pca.py` without asking the author. |
-| **Deribit MCP** (`deribit_mcp` + `deribit-base`/`deribit-http`/`deribit-websocket`/`deribit-api`) | MIT | Reuse directly if Deribit is added as an exchange. Its explicit-flag-plus-credentials trading gate is the model for our `LIVE_TRADING` switch. |
-| **"CORP"** | Unknown | Not identified — blocked pending a link/name from the project owner. |
+| **Hummingbot** | Apache 2.0 | Connector architecture pattern reused for `ExchangeAdapter` shape. |
+| **put-call-arb** (`lubintan`) | None found (all rights reserved) | Studied for methodology only; not copied. |
+| **Deribit MCP** | MIT | Not currently in use — Delta-only fast-track per Section L. Available if Deribit is reconsidered later. |
+| **"CORP"** | Unknown | Still not identified — deprioritized under the fast-track plan; revisit only if it becomes relevant. |
 
-**Open decision (K.2):** whether to validate the pipeline against Deribit first (fully documented, has reference prior art, unblocked today) before or instead of Delta-first as originally scoped (better fit for INR accounts, partially blocked on CoinSwitch's docs). Currently building Delta-first per the original scope; revisit if CoinSwitch access stalls.
+---
+
+## L. Fast-track plan (v2) — what changed and why
+
+### L.1 The instruction and the constraint
+
+The project owner asked to move as fast as possible to a real answer, and to cut anything that's "timepass" given the strategy is believed to be low-risk arbitrage. The honest response: **low-risk is the hypothesis this project exists to test, not a fact we've established yet** — Phase 3 only proved 1,504 pairs are structurally comparable, not that any are profitable. So the plan below compresses *time spent per step*, not the *number of steps*, because the steps that got questioned (backtesting, paper trading, risk/kill switch) are specifically the ones that catch a wrong hypothesis before it costs money.
+
+### L.2 Lean EV/Monte Carlo engine (replaces full Phase 5)
+
+- Real bid/ask pulled live for both legs of all 1,504 candidates, real fees per Section B, real net entry cost per D.2.
+- IV-at-T1 modeled via a small shock band (e.g. -30%/0/+30% of today's IV) instead of a fitted historical distribution — faster, clearly labeled as a simplification, upgradeable later without changing the interface.
+- Output: net EV, rough probability-of-profit, ranked — enough to answer "is there anything here" without the full statistical rigor of v1's plan.
+
+### L.3 Lean backtest + short paper trading (replaces full Phase 6/7)
+
+- Backtest: one pass, whatever historical window Delta's API exposes, one underlying, one threshold. Honestly reported, gaps disclosed, not silently padded.
+- Paper trading: window length is *derived from Phase 5's findings*, not fixed in advance — if positive-EV signals are frequent, days are enough for a real sample; if rare, it takes longer, and that's reported rather than cut short to hit an arbitrary deadline.
+
+### L.4 Risk engine + kill switch: not deferred
+
+Built alongside the execution engine (Phase 8/9 merged in the roadmap above), because these are specifically the cheap-to-build, high-value-per-hour components — skipping them doesn't save meaningful time and removes the one thing that limits damage if the lean EV/backtest pass turns out to be wrong in a way a small sample didn't catch.
+
+### L.5 What "later" actually means
+
+Deferred items (full backtest matrix, dashboard, CoinSwitch/Shark, alerting) come back into scope specifically **if and when the lean pass shows a real edge worth the additional engineering time** — not on a calendar date, and not automatically. If the lean pass shows no edge, the honest outcome is stopping, reporting why, and not building any of the deferred items at all.
 
 ---
 
 ## Status: what's built vs. what's pending
 
-**Built (this commit):**
-- `exchange_adapters/base.py` — `ExchangeAdapter` Protocol
-- `exchange_adapters/delta.py` — real Delta India adapter (testnet-first, no trading logic)
-- `normalization/schemas.py` — `OptionContract`, `MarketSnapshot` dataclasses
-- `db/schema.sql`, `db/init_db.py` — SQLite schema for Phase 2
-- `config/settings.py` — env-driven config, `LIVE_TRADING` hardcoded to `False`
+**Built and validated against real data:**
+- `exchange_adapters/base.py`, `delta.py`, `delta_ws.py` — REST + WebSocket, real testnet data flowing
+- `normalization/schemas.py` — `OptionContract`, `MarketSnapshot`
+- `collectors/market_data_collector.py`, `realtime_collector.py`, `run.py`, `run_realtime.py`, `gap_report.py`
+- `db/schema.sql`, `init_db.py` — populated with real instruments, market data, and 1,504 candidate pairs
+- `config/settings.py` — `LIVE_TRADING` hardcoded `False`
+- `matching/schemas.py`, `engine.py`, `run_matcher.py` — real run complete: 1,504 candidates found, 68,247 rejected, persisted
 
-**Not built yet (do not assume otherwise):**
-- Matching engine (Phase 3)
-- Pricing/EV/Monte Carlo engine (Phase 5)
-- Backtester (Phase 6)
+**Not built yet:**
+- Pricing/EV engine (Phase 5, lean version — building next)
+- Lean backtester (Phase 6)
 - Paper trading (Phase 7)
-- Execution engine (Phase 8) — and it will ship with `LIVE_TRADING = FALSE` regardless
-- Dashboard/alerting
+- Execution engine + risk/kill switch (Phase 8/9, built together)
+- Dashboard/alerting (deferred per Section L.5)
 
-**Outstanding items blocking Phase 1 closure:**
-1. CoinSwitch options API docs (request directly from CoinSwitch).
-2. Decision on Shark Exchange (drop vs. obtain their docs).
-3. Confirmation of underlying(s) and Delta account entity (India vs. Global).
-4. Decision on K.2 (Deribit-first vs. Delta-first).
-5. Clarification on "CORP".
+**Outstanding items, deprioritized under the fast-track plan (not resolved, not urgent):**
+1. CoinSwitch options API docs.
+2. Shark Exchange (dropped from scope).
+3. Clarification on "CORP".
