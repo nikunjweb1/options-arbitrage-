@@ -73,8 +73,18 @@ class DeltaConfig:
 
     @property
     def ws_base_url(self) -> str:
+        # Fixed 2026-08-21: the previous testnet value
+        # ("wss://testnet-socket.india.delta.exchange") does not resolve --
+        # confirmed via getaddrinfo failure on a live testnet run, then
+        # confirmed the replacement below via a direct successful
+        # websocket.create_connection() against it (unlike the old value,
+        # which was carried over from Phase 1 research and never actually
+        # dialed). This host also matches the same domain family
+        # (deltaex.org) that the REST testnet URL above already uses,
+        # unlike the old value which mixed in delta.exchange -- that
+        # mismatch itself was a signal worth catching earlier.
         if self.use_testnet:
-            return "wss://testnet-socket.india.delta.exchange"
+            return "wss://socket-ind.testnet.deltaex.org"
         return "wss://socket.india.delta.exchange"
 
 
