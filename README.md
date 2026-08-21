@@ -57,24 +57,28 @@ start Phase N+1 until Phase N's exit criterion is met.
 
 ## Current status
 
-**Phase 2: confirmed done by project owner.** Delta Exchange India REST adapter, WebSocket
-client, both collectors, and REST+WS integration test suites are built. (Note for the
-record: the code-level exit criteria in `docs/architecture.md` — a real 24h testnet run
-verified gap-free via `collectors/gap_report.py`, and a passing run of
-`test_delta_ws_integration.py` against real testnet — are what formally close this phase per
-the roadmap. If that validation run hasn't been executed yet, it's worth doing before Phase
-4 depends on data quality assumptions Phase 2 was meant to prove. Flagging this once, not
-blocking on it, since you've marked the phase done.)
+**Phase 2: done.** Delta Exchange India REST adapter, WebSocket client, both collectors,
+and REST+WS integration test suites are built and validated against real testnet data.
 
-**Phase 3: contract matching engine — built.** `matching/engine.py` implements the Section C
-structural checks (underlying, option type, option variant, settlement method, settlement
-price formula, strike tolerance) and the Section D.5 classification logic. Every rejection
-path and every genuine-match path is covered by `tests/test_matching_engine.py`, satisfying
-the Phase 3 exit criterion ("matcher correctly rejects deliberately-mismatched fixtures ...
-and correctly accepts genuine matches, in a test suite"). `matching/run_matcher.py` runs the
-engine against real captured data from the DB and persists results to `candidate_pairs` —
-this is what needs to be run against real Delta data next, per the Phase 2 MVP (Section J):
-self-matching Delta's own D1/D2/weekly chain first.
+**Phase 3: done.** `matching/engine.py` implements the Section C structural checks and
+Section D.5 classification logic, covered by `tests/test_matching_engine.py`.
+`matching/run_matcher.py` has been run against real Delta data: 1,504 candidate pairs
+found (433 same-exchange calendar spreads, 1,071 relative-value), 68,247 correctly
+rejected, persisted to `candidate_pairs`.
+
+**Phase 5 (pricing/EV engine): code complete and unit-tested against fixtures; the live
+run against real candidate_pairs is the one remaining step.**
+`pricing/black_scholes.py` (Black-Scholes pricer) and `pricing/ev_engine.py` (lean
+scenario-grid EV engine, Section L.2 — a 5-point underlying-price grid crossed with a
+3-point IV-shock grid, 15 scenarios per candidate) implement Section D.2–D.4 of the math
+spec. `pricing/run_pricing.py` is the CLI that wires real `candidate_pairs` to LIVE
+bid/ask + fee-schedule calls via the exchange adapters (never backfilled `market_data`)
+and persists EV / probability-of-profit / a ranking score to `signals`. All of this is
+covered by `tests/test_ev_engine.py` (fixture-based, no network) — every case has been
+re-verified. **What hasn't happened yet: an actual run against live Delta testnet data.**
+That's the real Phase 5 exit criterion ("EV, net-of-fees profit, and a probability-of-profit
+estimate computed for all 1,504 real candidates, using real bid/ask pulled live, not
+backfilled") — see "Running the pricing engine" below.
 
 No CoinSwitch or Shark adapters exist yet — CoinSwitch's options API is "available on
 request" (not self-serve docs) and Shark Exchange has no public options API documentation
@@ -84,17 +88,21 @@ found; both are blocked pending real documentation, not implemented against gues
 
 ```
 docs/
-  architecture.md              # full architecture, research findings, MVP plan (source of truth)
+  architecture.md              # full architecture, research findings, roadmap (source of truth)
 exchange_adapters/
   base.py                      # ExchangeAdapter protocol — every adapter implements this
   delta.py                     # Delta Exchange India REST adapter (testnet-first, read-only in Phase 2)
   delta_ws.py                  # Delta WebSocket client — real-time ticker feed
 normalization/
-  schemas.py                   # OptionContract, MarketSnapshot, etc. — exchange-agnostic
+  schemas.py                   # OptionContract, MarketSnapshot, FeeSchedule, ContractSpec — exchange-agnostic
 matching/
   schemas.py                    # MatchCandidate, RejectedPair, Classification, RejectionReason
   engine.py                      # MatchingEngine -- Section C checks + Section D.5 classification
   run_matcher.py                  # CLI: runs the engine against real DB data, persists candidate_pairs
+pricing/
+  black_scholes.py                 # European option pricer (Black-Scholes), used to reprice the long leg at T1
+  ev_engine.py                      # LeanEVEngine -- Section D.2-D.4 lean scenario-grid EV/probability-of-profit
+  run_pricing.py                     # CLI: prices real candidate_pairs against LIVE bid/ask, persists to signals
 collectors/
   market_data_collector.py      # REST-polling collector (instrument specs, fallback path)
   realtime_collector.py          # WebSocket-driven collector, sub-1s flush loop (primary path)
@@ -102,8 +110,9 @@ collectors/
   run_realtime.py                  # CLI for the realtime collector (python -m collectors.run_realtime)
   gap_report.py                     # verifies the Phase 2 "24h gap-free" exit criterion
 db/
-  schema.sql                        # SQLite schema (instruments, market_data, candidate_pairs, ...)
-  init_db.py                         # creates a local SQLite DB from schema.sql
+  schema.sql                        # SQLite schema (instruments, market_data, candidate_pairs, signals, trades)
+  init_db.py                         # creates a local SQLite DB from schema.sql (run as `python -m db.init_db`)
+  loaders.py                          # shared row -> dataclass loading helpers
 config/
   settings.py                         # env-driven config, LIVE_TRADING hardcoded default
   .env.example                         # no real secrets, ever
@@ -114,6 +123,7 @@ tests/
   test_delta_ws_integration.py             # real testnet WS integration suite, skipped unless explicitly enabled
   test_gap_report.py                       # gap-detection unit tests, no network
   test_matching_engine.py                   # Phase 3 exit-criterion suite: accepts/rejects fixtures
+  test_ev_engine.py                          # Phase 5 exit-criterion suite: black_scholes.py + ev_engine.py, fixture-based, no network
 requirements.txt
 pyproject.toml
 .gitignore
@@ -126,8 +136,13 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp config/.env.example config/.env   # fill in your own Delta testnet API keys, never commit
-python db/init_db.py
+python -m db.init_db
 ```
+
+Note: `db/init_db.py` must be run as a module (`python -m db.init_db`) from the repo root,
+not as a bare script (`python db/init_db.py`) — running it directly breaks the
+`from config.settings import DB` import because Python puts `db/` itself on `sys.path`
+instead of the repo root.
 
 Never commit `.env`, API keys, or account identifiers. `.gitignore` is configured to block
 common secret file patterns, but review diffs before pushing regardless.
@@ -163,6 +178,28 @@ python -m matching.run_matcher --underlying BTC --exchange delta_india --dry-run
 # Once you're happy with the results, drop --dry-run to persist to candidate_pairs
 python -m matching.run_matcher --underlying BTC --exchange delta_india
 ```
+
+## Running the pricing engine (Phase 5)
+
+Requires `candidate_pairs` to already be populated (run the matcher above first) and
+network access to Delta's testnet REST API for live ticker/fee-schedule calls.
+
+```bash
+# Smoke test first -- small, non-destructive (nothing written to `signals`)
+python -m pricing.run_pricing --underlying BTC --limit 20 --dry-run
+
+# Full run against all real candidates, writes EV/probability-of-profit/score to `signals`
+python -m pricing.run_pricing --underlying BTC
+
+# Useful filters
+python -m pricing.run_pricing --underlying BTC --min-confidence 0.8 --classification same_exchange_calendar_spread --top 50
+```
+
+Watch the summary line (`N priced, M skipped (no data), K skipped (no fees), P of N show
+positive EV`) — a high skip count usually means a testnet endpoint or fee-schedule call
+isn't behaving as expected, not that the candidates themselves are bad. `pricing/ev_engine.py`
+fails closed on any candidate missing an executable bid/ask (per Section A.1) rather than
+substituting mark price, so legitimate data gaps show up as skips, not silently-wrong EVs.
 
 ## License note
 
