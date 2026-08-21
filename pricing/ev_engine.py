@@ -1,0 +1,226 @@
+"""
+Lean EV/scenario engine -- Phase 5, per docs/architecture.md Section L.2.
+
+Implements Section D.2 (entry economics), D.3 (long-leg repricing at T1),
+and D.4 (P&L per scenario) using a small deterministic scenario grid instead
+of a full Monte Carlo simulation or a fitted historical IV distribution.
+
+WHY A GRID, NOT JUST AN IV SHOCK BAND: the short leg's settlement payoff
+(Section D.4, Short_payoff) depends on the underlying price at T1, not on
+IV at all -- IV only affects the long leg's repriced value. A model that
+only shocks IV at a fixed spot price would silently ignore the dominant
+source of P&L variance for this strategy (the short leg's own payoff). So
+this engine crosses a small underlying-price grid (5 points, discretized
+from a lognormal move over the time-to-T1 using the short leg's own IV as
+the move-size estimate) with a small IV-shock grid (3 points) -- 15
+scenarios total. This is still far cheaper than a real Monte Carlo (Section
+D.4/Phase 5 v1 called for thousands of paths) but keeps the one relationship
+that actually matters: short-leg payoff depends on where the underlying
+actually goes.
+
+WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
+  - Does not fit sigma_effective_at_T1 to historical IV term-structure
+    behavior -- uses today's observed IV as the base and a fixed +/-30%
+    shock band around it.
+  - Does not model IV smile/skew across strikes.
+  - Scenario weights are a discretized-normal approximation, not a properly
+    calibrated risk-neutral distribution.
+  - Does not account for legging risk, slippage beyond a flat assumption,
+    or partial fills -- those are Phase 8/9 concerns (execution engine +
+    risk engine), not this pricing step.
+Every EVResult carries a `model_notes` field stating this explicitly so a
+result is never mistaken for more rigorous than it is.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from scipy.stats import norm
+
+from matching.schemas import MatchCandidate
+from normalization.schemas import MarketSnapshot, OptionType
+from pricing.black_scholes import OptionKind, black_scholes_price, settlement_payoff
+
+# Underlying-price scenario grid, in standard-deviation units of the
+# lognormal move over time-to-T1. 5 points is a coarse discretization of a
+# continuous distribution -- documented as a lean-plan simplification, not
+# presented as equivalent to a real Monte Carlo run.
+_PRICE_GRID_Z = (-2.0, -1.0, 0.0, 1.0, 2.0)
+
+# IV shock grid applied to the long leg's repricing at each price scenario.
+_IV_SHOCK_GRID = (-0.30, 0.0, 0.30)
+
+_RISK_FREE_RATE = 0.0  # crypto options: no natural risk-free rate; treated as 0 per Section D.3's r term, documented rather than left implicit.
+
+
+def _grid_weights(z_points: tuple[float, ...]) -> list[float]:
+    """
+    Discretized-normal weights for the given z-score grid points, normalized
+    to sum to 1.0. This is a simple pdf-at-point-normalized-by-sum
+    approximation, not a proper Gaussian quadrature -- adequate for a lean
+    5-point grid, not something to rely on for tail-risk precision.
+    """
+    raw = [norm.pdf(z) for z in z_points]
+    total = sum(raw)
+    return [w / total for w in raw]
+
+
+@dataclass(frozen=True)
+class EVResult:
+    pair_id: str
+    net_entry_cost: Decimal
+    expected_value: Decimal
+    probability_of_profit: Decimal
+    worst_case_pnl: Decimal
+    best_case_pnl: Decimal
+    scenario_count: int
+    short_bid_used: Decimal
+    long_ask_used: Decimal
+    fees_total: Decimal
+    model_notes: tuple[str, ...] = field(default_factory=lambda: (
+        "Lean scenario grid (Section L.2), not a full Monte Carlo or "
+        "historical-IV-fitted model -- see pricing/ev_engine.py module "
+        "docstring for exactly what's simplified.",
+    ))
+    computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class InsufficientDataError(RuntimeError):
+    """Raised when a candidate can't be priced -- e.g. no executable bid/ask.
+    Per architecture.md's fail-closed principle: a pair with missing data is
+    excluded from results, never silently scored as zero or skipped without
+    a trace."""
+
+
+class LeanEVEngine:
+    def __init__(
+        self,
+        short_taker_fee_pct: Decimal,
+        long_taker_fee_pct: Decimal,
+        risk_free_rate: float = _RISK_FREE_RATE,
+    ) -> None:
+        self._short_fee_pct = short_taker_fee_pct
+        self._long_fee_pct = long_taker_fee_pct
+        self._risk_free_rate = risk_free_rate
+
+    def evaluate(
+        self,
+        candidate: MatchCandidate,
+        short_snapshot: MarketSnapshot,
+        long_snapshot: MarketSnapshot,
+    ) -> EVResult:
+        """
+        Per Section D.2: this REQUIRES executable bid/ask on both legs. A
+        snapshot without both is not scored -- raises InsufficientDataError
+        rather than falling back to mark price, per the executable-price-only
+        principle in Section A.1.
+        """
+        if not short_snapshot.is_executable() or not long_snapshot.is_executable():
+            raise InsufficientDataError(
+                f"{candidate.pair_id}: missing executable bid/ask on one or both legs "
+                f"(short executable={short_snapshot.is_executable()}, "
+                f"long executable={long_snapshot.is_executable()}). Per Section A.1, "
+                f"mark price is never substituted for a missing bid/ask."
+            )
+
+        short_bid = short_snapshot.best_bid
+        long_ask = long_snapshot.best_ask
+
+        # -- Section D.2: entry economics --------------------------------------
+
+        gross_entry_credit = short_bid - long_ask
+        short_fee = short_bid * self._short_fee_pct
+        long_fee = long_ask * self._long_fee_pct
+        fees_total = short_fee + long_fee
+        net_entry_cost = gross_entry_credit - fees_total
+
+        # -- Section D.3/D.4: scenario grid over price x IV shock --------------
+
+        short = candidate.short_contract
+        long_ = candidate.long_contract
+
+        # Time to T1 (short expiry), in years, from now -- this determines
+        # both the price-move magnitude for the grid and how much life the
+        # long leg has left at T1.
+        now = datetime.now(timezone.utc)
+        time_to_T1_years = max(
+            (short.expiry_timestamp - now).total_seconds() / (365 * 24 * 3600), 0.0
+        )
+        time_to_T2_at_T1_years = max(
+            (long_.expiry_timestamp - short.expiry_timestamp).total_seconds() / (365 * 24 * 3600), 0.0
+        )
+
+        # Use the short leg's own observed IV as the move-size estimate for
+        # the price grid -- if IV is missing (Delta didn't return one),
+        # fall back to a conservative flat 80% annualized vol assumption for
+        # crypto options rather than dividing by zero or crashing the batch.
+        base_iv = float(short_snapshot.iv) if short_snapshot.iv is not None and short_snapshot.iv > 0 else 0.80
+
+        spot_now = short_snapshot.underlying_spot or short_snapshot.underlying_index
+        if spot_now is None:
+            raise InsufficientDataError(
+                f"{candidate.pair_id}: no underlying spot/index price available on the "
+                f"short leg's snapshot -- cannot build the price scenario grid."
+            )
+
+        sigma_move = base_iv * math.sqrt(time_to_T1_years) if time_to_T1_years > 0 else 0.0
+        price_weights = _grid_weights(_PRICE_GRID_Z)
+
+        short_kind = OptionKind.CALL if short.option_type == OptionType.CALL else OptionKind.PUT
+        long_kind = OptionKind.CALL if long_.option_type == OptionType.CALL else OptionKind.PUT
+
+        pnl_scenarios: list[tuple[Decimal, float]] = []  # (pnl, combined_weight)
+
+        for z, p_weight in zip(_PRICE_GRID_Z, price_weights):
+            # Lognormal price move: S_T1 = S_now * exp(z * sigma_move - 0.5*sigma_move^2)
+            # (the drift-adjustment term keeps E[S_T1] ~= S_now under this
+            # discretization, consistent with a risk-neutral-ish assumption --
+            # again, a simplification, not a calibrated forward price).
+            move_factor = math.exp(z * sigma_move - 0.5 * sigma_move**2) if sigma_move > 0 else 1.0
+            s_t1 = spot_now * Decimal(str(move_factor))
+
+            short_payoff = settlement_payoff(s_t1, short.strike, short_kind)
+
+            for iv_shock, iv_weight in zip(_IV_SHOCK_GRID, [1 / len(_IV_SHOCK_GRID)] * len(_IV_SHOCK_GRID)):
+                sigma_at_t1 = max(base_iv * (1 + iv_shock), 0.01)
+                v_long = black_scholes_price(
+                    spot=s_t1,
+                    strike=long_.strike,
+                    time_to_expiry_years=time_to_T2_at_T1_years,
+                    volatility=sigma_at_t1,
+                    risk_free_rate=self._risk_free_rate,
+                    option_kind=long_kind,
+                )
+
+                # Exit fee on the long leg's repriced value at T1 -- short
+                # leg's fee already accounted for in net_entry_cost (Section
+                # D.2); this exit_fee is Section D.4's "exit_fees(long)" term.
+                exit_fee = v_long * self._long_fee_pct
+
+                pnl = net_entry_cost - short_payoff + v_long - exit_fee
+                combined_weight = p_weight * iv_weight
+                pnl_scenarios.append((pnl, combined_weight))
+
+        total_weight = sum(w for _, w in pnl_scenarios)
+        expected_value = sum(pnl * Decimal(str(w)) for pnl, w in pnl_scenarios) / Decimal(str(total_weight))
+        profitable_weight = sum(w for pnl, w in pnl_scenarios if pnl > 0)
+        probability_of_profit = Decimal(str(profitable_weight / total_weight))
+        worst_case = min(pnl for pnl, _ in pnl_scenarios)
+        best_case = max(pnl for pnl, _ in pnl_scenarios)
+
+        return EVResult(
+            pair_id=candidate.pair_id,
+            net_entry_cost=net_entry_cost,
+            expected_value=expected_value,
+            probability_of_profit=probability_of_profit,
+            worst_case_pnl=worst_case,
+            best_case_pnl=best_case,
+            scenario_count=len(pnl_scenarios),
+            short_bid_used=short_bid,
+            long_ask_used=long_ask,
+            fees_total=fees_total,
+        )
