@@ -30,6 +30,34 @@ WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
     risk engine), not this pricing step.
 Every EVResult carries a `model_notes` field stating this explicitly so a
 result is never mistaken for more rigorous than it is.
+
+BUG FOUND + FIXED post-Phase-5-smoke-run (2026-08-21): settlement_payoff()
+and black_scholes_price() both operate in raw underlying-price terms (e.g.
+dollars per 1 BTC) -- they have no notion of contract size. short_bid and
+long_ask, by contrast, are real exchange-quoted premiums, which are already
+scaled to one contract's notional via OptionContract.contract_multiplier
+(e.g. 0.001 BTC/contract on Delta). Before this fix, short_payoff and
+v_long were combined directly with net_entry_cost with no multiplier
+applied, mixing "dollars per contract" with "dollars per 1 BTC" -- a scale
+error of roughly 1/contract_multiplier. Two symptoms in the first live run
+against all 1,504 candidates traced back to exactly this:
+  1. EV magnitudes far too large relative to net entry cost (e.g. EV=7613
+     against a net entry cost of -1505) -- the unscaled payoff/repricing
+     terms dominated the correctly-scaled entry economics.
+  2. P(profit)=1.0 exactly, repeatedly, for the top-ranked (mostly
+     exact-strike, same-exchange calendar spread) candidates. For an
+     exact-strike calendar spread, short_payoff and the long leg's intrinsic
+     value at T1 are identical, so (v_long - short_payoff) is just the long
+     leg's remaining time value -- structurally >= 0 for any European option
+     with positive time-to-expiry. Left unscaled, that always-non-negative
+     term swamped net_entry_cost in every one of the 15 grid scenarios,
+     making every exact-strike candidate look risk-free. That is a modeling
+     artifact, not a real edge.
+Fix: multiply short_payoff by short_contract.contract_multiplier and
+v_long by long_contract.contract_multiplier before combining them with
+net_entry_cost, so every term in the P&L formula is in the same units
+(dollars per contract). See tests/test_ev_engine.py::TestLeanEVEngineUnitConsistency
+for the regression test that would have caught this.
 """
 
 from __future__ import annotations
@@ -84,7 +112,9 @@ class EVResult:
     model_notes: tuple[str, ...] = field(default_factory=lambda: (
         "Lean scenario grid (Section L.2), not a full Monte Carlo or "
         "historical-IV-fitted model -- see pricing/ev_engine.py module "
-        "docstring for exactly what's simplified.",
+        "docstring for exactly what's simplified. Payoff/repricing terms "
+        "are scaled by each leg's own contract_multiplier so they're in "
+        "the same per-contract units as the quoted premiums.",
     ))
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -131,6 +161,9 @@ class LeanEVEngine:
         long_ask = long_snapshot.best_ask
 
         # -- Section D.2: entry economics --------------------------------------
+        # short_bid/long_ask are real exchange-quoted premiums -- already
+        # scaled to one contract's notional by the exchange itself. Nothing
+        # here needs contract_multiplier applied a second time.
 
         gross_entry_credit = short_bid - long_ask
         short_fee = short_bid * self._short_fee_pct
@@ -183,11 +216,16 @@ class LeanEVEngine:
             move_factor = math.exp(z * sigma_move - 0.5 * sigma_move**2) if sigma_move > 0 else 1.0
             s_t1 = spot_now * Decimal(str(move_factor))
 
-            short_payoff = settlement_payoff(s_t1, short.strike, short_kind)
+            # settlement_payoff() returns the payoff per 1 unit of underlying
+            # (e.g. per 1 BTC) -- scale by the short leg's own
+            # contract_multiplier so it's in the same "per contract" units as
+            # short_bid/net_entry_cost. See module docstring's BUG FOUND note.
+            short_payoff_raw = settlement_payoff(s_t1, short.strike, short_kind)
+            short_payoff = short_payoff_raw * short.contract_multiplier
 
             for iv_shock, iv_weight in zip(_IV_SHOCK_GRID, [1 / len(_IV_SHOCK_GRID)] * len(_IV_SHOCK_GRID)):
                 sigma_at_t1 = max(base_iv * (1 + iv_shock), 0.01)
-                v_long = black_scholes_price(
+                v_long_raw = black_scholes_price(
                     spot=s_t1,
                     strike=long_.strike,
                     time_to_expiry_years=time_to_T2_at_T1_years,
@@ -195,10 +233,18 @@ class LeanEVEngine:
                     risk_free_rate=self._risk_free_rate,
                     option_kind=long_kind,
                 )
+                # Same unit fix as short_payoff above, using the long leg's
+                # own contract_multiplier (in practice equal to the short
+                # leg's for a same-underlying calendar spread, but each leg
+                # is scaled by its own contract spec rather than assuming
+                # they match, per architecture.md's adapter-isolation rule).
+                v_long = v_long_raw * long_.contract_multiplier
 
                 # Exit fee on the long leg's repriced value at T1 -- short
                 # leg's fee already accounted for in net_entry_cost (Section
                 # D.2); this exit_fee is Section D.4's "exit_fees(long)" term.
+                # Computed from the already-scaled v_long so the fee itself
+                # is in per-contract dollars too.
                 exit_fee = v_long * self._long_fee_pct
 
                 pnl = net_entry_cost - short_payoff + v_long - exit_fee

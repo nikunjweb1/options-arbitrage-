@@ -252,3 +252,105 @@ class TestLeanEVEngineScenarioGrid:
 
         assert result.scenario_count == 15
         assert result.model_notes  # always carries the lean-model disclosure
+
+
+class TestLeanEVEngineUnitConsistency:
+    """
+    Regression tests for the contract_multiplier unit-mismatch bug found
+    during the first live Phase 5 run against all 1,504 real candidates
+    (2026-08-21). Before the fix, settlement_payoff() and
+    black_scholes_price() were combined with net_entry_cost with no
+    contract_multiplier applied, mixing "dollars per contract" (real
+    exchange premiums) with "dollars per 1 unit of underlying" (raw
+    intrinsic/BS values) -- roughly a 1/contract_multiplier scale error.
+
+    Symptoms this produced on the real run: EV magnitudes ~5x the net entry
+    cost on a short-dated options calendar spread, and P(profit)=1.0 exactly
+    for every one of the top 20 ranked candidates. See pricing/ev_engine.py's
+    module docstring "BUG FOUND + FIXED" note for the full writeup.
+    """
+
+    def test_ev_stays_within_a_sane_multiple_of_net_entry_cost(self) -> None:
+        """
+        Before the fix, this exact scenario produced EV ~3124 against a net
+        entry cost of ~-1.00 (a ~3000x blowup) because the unscaled payoff/
+        repricing terms swamped the correctly-scaled entry economics. After
+        the fix, EV should sit within a small, sane multiple of the entry
+        cost -- this is a regression guard against that specific unit
+        mismatch reappearing, not a claim about what "sane" EV should be in
+        general.
+        """
+        short = _make_contract(
+            instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1,
+            contract_multiplier=Decimal("0.001"),
+        )
+        long_ = _make_contract(
+            instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2,
+            contract_multiplier=Decimal("0.001"),
+        )
+        candidate = _make_candidate(short, long_)
+
+        # Realistic Delta-scale premiums for a 0.001 BTC contract -- small
+        # dollar amounts, not thousands, and consistent with the multiplier
+        # above (this is the shape real live quotes actually take).
+        short_snap = _make_snapshot(
+            instrument_id="1", best_bid=Decimal("2.00"), best_ask=Decimal("2.10"), iv=Decimal("1.20"),
+        )
+        long_snap = _make_snapshot(
+            instrument_id="2", best_bid=Decimal("2.90"), best_ask=Decimal("3.00"), iv=Decimal("1.20"),
+        )
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert abs(result.expected_value) < abs(result.net_entry_cost) * 20, (
+            f"EV={result.expected_value} looks disproportionate to "
+            f"net_entry_cost={result.net_entry_cost} -- check that "
+            f"contract_multiplier is being applied to short_payoff and v_long."
+        )
+
+    def test_exact_strike_calendar_spread_shows_genuine_tail_risk(self) -> None:
+        """
+        For an exact-strike same-exchange calendar spread, the long leg's
+        Black-Scholes value at T1 can never fall below its own intrinsic
+        value, which (at matching strikes) equals the short leg's
+        settlement payoff. So (v_long - short_payoff) -- the long leg's
+        remaining time value -- is structurally >= 0 in every scenario,
+        regardless of contract_multiplier. That's expected, real calendar-
+        spread behavior, not a bug on its own.
+
+        What the multiplier bug did was inflate that time-value term to a
+        scale that swamped a realistically-sized net debit in every one of
+        the 15 grid scenarios, making every exact-strike candidate look
+        risk-free. With premiums and payoffs on the same (correct) scale,
+        a real net debit should be able to exceed the shrinking time value
+        in the tail scenarios (large moves away from the strike), producing
+        a genuine loss -- which is the actual, bounded risk this trade
+        carries in real markets.
+        """
+        short = _make_contract(
+            instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1,
+            contract_multiplier=Decimal("0.001"),
+        )
+        long_ = _make_contract(
+            instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2,
+            contract_multiplier=Decimal("0.001"),
+        )
+        candidate = _make_candidate(short, long_)
+
+        short_snap = _make_snapshot(
+            instrument_id="1", best_bid=Decimal("2.00"), best_ask=Decimal("2.10"), iv=Decimal("1.20"),
+        )
+        long_snap = _make_snapshot(
+            instrument_id="2", best_bid=Decimal("2.90"), best_ask=Decimal("3.00"), iv=Decimal("1.20"),
+        )
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert result.worst_case_pnl < Decimal("0"), (
+            "A debit-funded exact-strike calendar spread should show at "
+            "least one losing scenario in the grid -- P(profit)=1.0 here "
+            "would indicate the unit-mismatch artifact is back."
+        )
+        assert result.probability_of_profit < Decimal("1.0")
