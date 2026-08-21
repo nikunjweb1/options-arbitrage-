@@ -1,8 +1,10 @@
 """
 Initializes the local SQLite database from db/schema.sql.
 
-Usage:
-    python db/init_db.py
+Usage (must be run as a module from the repo root, not as a direct script --
+running `python db/init_db.py` sets sys.path[0] to db/ instead of the repo
+root, which breaks the `from config.settings import DB` import below):
+    python -m db.init_db
 
 Safe to re-run: every table is created with CREATE TABLE IF NOT EXISTS, so
 this never drops or overwrites existing data.
