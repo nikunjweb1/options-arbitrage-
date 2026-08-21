@@ -57,18 +57,24 @@ start Phase N+1 until Phase N's exit criterion is met.
 
 ## Current status
 
-**Phase 2: market-data collectors — adapters and integration tests built, real testnet
-validation run still pending.** Delta Exchange India REST adapter, WebSocket client, both a
-polling collector and a real-time collector, and integration test suites for both (REST and
-WS) exist. What's still outstanding before Phase 2 can be marked done:
+**Phase 2: confirmed done by project owner.** Delta Exchange India REST adapter, WebSocket
+client, both collectors, and REST+WS integration test suites are built. (Note for the
+record: the code-level exit criteria in `docs/architecture.md` — a real 24h testnet run
+verified gap-free via `collectors/gap_report.py`, and a passing run of
+`test_delta_ws_integration.py` against real testnet — are what formally close this phase per
+the roadmap. If that validation run hasn't been executed yet, it's worth doing before Phase
+4 depends on data quality assumptions Phase 2 was meant to prove. Flagging this once, not
+blocking on it, since you've marked the phase done.)
 
-1. Actually running `RUN_INTEGRATION_TESTS=true pytest tests/test_delta_ws_integration.py -v -s`
-   against real testnet, to confirm the WebSocket subscribe/message-format assumptions hold.
-2. A **24h continuous run** using the realtime collector, verified gap-free via
-   `collectors/gap_report.py`.
-
-Nothing in this repo claims either of those has happened yet just because the code to do
-them exists.
+**Phase 3: contract matching engine — built.** `matching/engine.py` implements the Section C
+structural checks (underlying, option type, option variant, settlement method, settlement
+price formula, strike tolerance) and the Section D.5 classification logic. Every rejection
+path and every genuine-match path is covered by `tests/test_matching_engine.py`, satisfying
+the Phase 3 exit criterion ("matcher correctly rejects deliberately-mismatched fixtures ...
+and correctly accepts genuine matches, in a test suite"). `matching/run_matcher.py` runs the
+engine against real captured data from the DB and persists results to `candidate_pairs` —
+this is what needs to be run against real Delta data next, per the Phase 2 MVP (Section J):
+self-matching Delta's own D1/D2/weekly chain first.
 
 No CoinSwitch or Shark adapters exist yet — CoinSwitch's options API is "available on
 request" (not self-serve docs) and Shark Exchange has no public options API documentation
@@ -85,6 +91,10 @@ exchange_adapters/
   delta_ws.py                  # Delta WebSocket client — real-time ticker feed
 normalization/
   schemas.py                   # OptionContract, MarketSnapshot, etc. — exchange-agnostic
+matching/
+  schemas.py                    # MatchCandidate, RejectedPair, Classification, RejectionReason
+  engine.py                      # MatchingEngine -- Section C checks + Section D.5 classification
+  run_matcher.py                  # CLI: runs the engine against real DB data, persists candidate_pairs
 collectors/
   market_data_collector.py      # REST-polling collector (instrument specs, fallback path)
   realtime_collector.py          # WebSocket-driven collector, sub-1s flush loop (primary path)
@@ -92,7 +102,7 @@ collectors/
   run_realtime.py                  # CLI for the realtime collector (python -m collectors.run_realtime)
   gap_report.py                     # verifies the Phase 2 "24h gap-free" exit criterion
 db/
-  schema.sql                        # SQLite schema for Phase 2 (instruments, market_data, ...)
+  schema.sql                        # SQLite schema (instruments, market_data, candidate_pairs, ...)
   init_db.py                         # creates a local SQLite DB from schema.sql
 config/
   settings.py                         # env-driven config, LIVE_TRADING hardcoded default
@@ -101,8 +111,9 @@ tests/
   test_delta_adapter.py                 # REST normalization unit tests, fixture-based, no network
   test_delta_ws.py                       # WS parsing + flush-ceiling unit tests, no network
   test_delta_integration.py               # real testnet REST integration suite, skipped unless explicitly enabled
-  test_delta_ws_integration.py             # real testnet WS integration suite (subscribe format, reconnect, e2e persistence), skipped unless explicitly enabled
+  test_delta_ws_integration.py             # real testnet WS integration suite, skipped unless explicitly enabled
   test_gap_report.py                       # gap-detection unit tests, no network
+  test_matching_engine.py                   # Phase 3 exit-criterion suite: accepts/rejects fixtures
 requirements.txt
 pyproject.toml
 .gitignore
@@ -141,6 +152,16 @@ python -m collectors.run --duration-hours 24
 
 # Check either run's output for gaps
 python -m collectors.gap_report
+```
+
+## Running the matcher
+
+```bash
+# Self-match Delta's own D1/D2/weekly chain first (Phase 2 MVP, Section J)
+python -m matching.run_matcher --underlying BTC --exchange delta_india --dry-run
+
+# Once you're happy with the results, drop --dry-run to persist to candidate_pairs
+python -m matching.run_matcher --underlying BTC --exchange delta_india
 ```
 
 ## License note
