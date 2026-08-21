@@ -30,6 +30,19 @@ WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
     risk engine), not this pricing step.
 Every EVResult carries a `model_notes` field stating this explicitly so a
 result is never mistaken for more rigorous than it is.
+
+BUGFIX (see git history): the long leg's Black-Scholes repricing at T1 was
+previously using the SHORT leg's IV (`base_iv`, sourced from
+short_snapshot.iv) as the volatility input for `v_long`. That's wrong -- the
+long leg has its own market-quoted IV, and reusing the short leg's IV
+silently injected a systematic pricing bias into every one of the 15
+scenarios (not just some), which is what produced P(profit)=1.0 exactly and
+inflated EV magnitudes on the first live Phase 5 run. This was especially
+bad when the short leg was near-0DTE, since near-expiry IV quotes are
+numerically noisy and that noise was being carried into a 30+ day repricing.
+`base_iv` (short leg) is still correctly used for `sigma_move`, which sizes
+the underlying's price move to T1 -- that part was never wrong. Only the
+long-leg BS volatility input was switched to `long_base_iv`.
 """
 
 from __future__ import annotations
@@ -55,6 +68,11 @@ _PRICE_GRID_Z = (-2.0, -1.0, 0.0, 1.0, 2.0)
 _IV_SHOCK_GRID = (-0.30, 0.0, 0.30)
 
 _RISK_FREE_RATE = 0.0  # crypto options: no natural risk-free rate; treated as 0 per Section D.3's r term, documented rather than left implicit.
+
+# Conservative flat annualized vol fallback for crypto options, used only
+# when Delta doesn't return an IV for the relevant leg -- documented so it's
+# never mistaken for a fitted or calibrated number.
+_FALLBACK_ANNUALIZED_VOL = 0.80
 
 
 def _grid_weights(z_points: tuple[float, ...]) -> list[float]:
@@ -156,9 +174,31 @@ class LeanEVEngine:
 
         # Use the short leg's own observed IV as the move-size estimate for
         # the price grid -- if IV is missing (Delta didn't return one),
-        # fall back to a conservative flat 80% annualized vol assumption for
+        # fall back to a conservative flat annualized vol assumption for
         # crypto options rather than dividing by zero or crashing the batch.
-        base_iv = float(short_snapshot.iv) if short_snapshot.iv is not None and short_snapshot.iv > 0 else 0.80
+        # This is correctly scoped to the short leg: it estimates how far the
+        # underlying might move by T1, which is a property of the short leg's
+        # own remaining life, not the long leg's.
+        base_iv = (
+            float(short_snapshot.iv)
+            if short_snapshot.iv is not None and short_snapshot.iv > 0
+            else _FALLBACK_ANNUALIZED_VOL
+        )
+
+        # BUGFIX: the long leg's Black-Scholes repricing at T1 must use the
+        # LONG leg's own IV, not the short leg's. These are different
+        # contracts with different remaining time and (on a real vol term
+        # structure) different implied vols -- reusing base_iv here silently
+        # injected the short leg's IV (often the noisiest reading on the
+        # board, since the short leg is frequently near-0DTE) into a
+        # 30+ day repricing, biasing every one of the 15 scenarios in the
+        # same direction. Same fallback behavior as base_iv if Delta doesn't
+        # return an IV for this leg.
+        long_base_iv = (
+            float(long_snapshot.iv)
+            if long_snapshot.iv is not None and long_snapshot.iv > 0
+            else _FALLBACK_ANNUALIZED_VOL
+        )
 
         spot_now = short_snapshot.underlying_spot or short_snapshot.underlying_index
         if spot_now is None:
@@ -186,7 +226,9 @@ class LeanEVEngine:
             short_payoff = settlement_payoff(s_t1, short.strike, short_kind)
 
             for iv_shock, iv_weight in zip(_IV_SHOCK_GRID, [1 / len(_IV_SHOCK_GRID)] * len(_IV_SHOCK_GRID)):
-                sigma_at_t1 = max(base_iv * (1 + iv_shock), 0.01)
+                # BUGFIX: was `base_iv * (1 + iv_shock)` -- now uses the long
+                # leg's own IV as the base for its own repricing.
+                sigma_at_t1 = max(long_base_iv * (1 + iv_shock), 0.01)
                 v_long = black_scholes_price(
                     spot=s_t1,
                     strike=long_.strike,
