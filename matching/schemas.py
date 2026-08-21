@@ -12,7 +12,7 @@ way to audit *why* something didn't match without re-running it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 
@@ -54,7 +54,7 @@ class MatchCandidate:
     match_confidence: Decimal       # 1.0 = exact structural match, <1.0 = interpolated/lower confidence
     classification: Classification
     strike_diff: Decimal
-    expiry_gap: "timedelta"  # noqa: F821 -- imported below, quoted to avoid unused-import lint noise
+    expiry_gap: timedelta
     same_exchange: bool
     notes: tuple[str, ...] = field(default_factory=tuple)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
