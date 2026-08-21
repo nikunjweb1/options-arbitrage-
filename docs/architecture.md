@@ -1,7 +1,7 @@
 # Cross-Exchange Options Expiry/IV Arbitrage System
 ## Architecture, Research Findings & Roadmap — v2 (Fast-Track)
 
-**Status:** Phase 2 (data collection) and Phase 3 (contract matching) complete, validated against real Delta testnet data. Live trading remains disabled by design throughout this document.
+**Status:** Phase 2 (data collection) and Phase 3 (contract matching) complete, validated against real Delta testnet data. Phase 5 (pricing/EV engine) code is built and unit-tested against fixtures; it has not yet been run against live data (see Status section at the bottom). Live trading remains disabled by design throughout this document.
 
 **v2 revision note:** After Phase 3 produced real results (374 live BTC contracts, 1,504 structurally valid candidate pairs found, 68,247 correctly rejected), the project owner asked to move as fast as possible to a real answer on whether this strategy has an edge, and to cut anything that isn't load-bearing. This revision compresses Phases 5-10 into leaner, faster versions. **What did not change:** backtesting, paper trading, and the risk/kill-switch layer are still in the plan — they're the only things standing between "we think this works" and finding out with real money that it doesn't, on a strategy whose "low risk" premise is exactly the thing this project exists to verify rather than assume. What changed is scope and depth, not whether these steps happen. See Section L for the compressed plan and the honest trade-offs it makes.
 
@@ -64,13 +64,15 @@ This doesn't kill the project. It means **Phase 1's real deliverable is figuring
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│           PRICING / EV / MONTE CARLO ENGINE  ← BUILDING NEXT         │
+│  PRICING / EV / MONTE CARLO ENGINE (code + CLI built; live run       │
+│  pending -- see Status section)                                       │
 │  lean version per Section L — real bid/ask, real fees, real EV        │
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       OPPORTUNITY SCANNER                             │
-│  continuous scan → executable net entry → classify → score            │
+│  folded into pricing/run_pricing.py's ranking pass for the lean plan  │
+│  (see Section L.2) -- continuous/standalone scanner remains deferred  │
 └───────────────┬────────────────────────────────────────────────────-┘
         ┌───────┴────────┐
         ▼                ▼
@@ -257,10 +259,12 @@ This table is unchanged from v1. Per the fast-track discussion: risk limits and 
 
 **Phase 3 — Contract matcher.** ✅ Done. Real run against 374 live Delta contracts: 1,504 candidates found (433 exact same-exchange calendar spreads, 1,071 relative-value), 68,247 correctly rejected. Persisted to `candidate_pairs`.
 
-**Phase 5 — Pricing/EV engine.** 🔨 Building next, lean version (Section D.3 simplification, Section L.2).
+**Phase 5 — Pricing/EV engine.** 🔨 Code complete, unit-tested against fixtures; live run against real candidate_pairs pending. Lean version (Section D.3 simplification, Section L.2).
+- Built this session: `pricing/run_pricing.py` — CLI that loads real `candidate_pairs`, pulls LIVE bid/ask + fee schedules via the exchange adapters (not backfilled `market_data`), runs `pricing/ev_engine.py`'s `LeanEVEngine` on each, and persists EV/probability-of-profit/ranking to `signals`. `pricing/black_scholes.py` and `pricing/ev_engine.py` (the actual math) already existed; `tests/test_ev_engine.py` (new) covers both against fixtures.
+- **Not yet done: an actual run against live Delta testnet data.** The exit criterion below requires live bid/ask, not fixture data — run `python -m pricing.run_pricing --underlying BTC` (start with `--limit 50 --dry-run` as a smoke test) from an environment with network access to Delta's testnet before treating any EV numbers as real.
 - Exit criteria (lean): EV, net-of-fees profit, and a probability-of-profit estimate computed for all 1,504 real candidates, using real bid/ask pulled live, not backfilled.
 
-**Phase 6 — Lean backtester.** Next after Phase 5. Per Section G.2.
+**Phase 6 — Lean backtester.** Next after Phase 5's live run. Per Section G.2.
 - Exit criteria (lean): one honest report, whatever window the data supports, explicitly labeled "lean pass" — a clear go/no-go signal on whether to invest in the fuller v1 backtest matrix.
 
 **Phase 7 — Short paper trading window.** Sized to observed signal frequency from Phase 5/6 (Section L.3), not a fixed multi-week duration.
@@ -275,7 +279,7 @@ This table is unchanged from v1. Per the fast-track discussion: risk limits and 
 
 ## J. MVP — superseded by real results
 
-The v1 MVP question ("does Delta's own calendar structure produce candidates at all?") is answered: yes, 433 exact-strike same-exchange calendar-spread candidates exist structurally. The next question — "do any of them have positive expected value after real costs?" — is what Phase 5 (lean) answers next.
+The v1 MVP question ("does Delta's own calendar structure produce candidates at all?") is answered: yes, 433 exact-strike same-exchange calendar-spread candidates exist structurally. The next question — "do any of them have positive expected value after real costs?" — is what a live Phase 5 run answers next (code is ready; the run itself is the remaining step, per the Status section).
 
 ---
 
@@ -298,9 +302,10 @@ The project owner asked to move as fast as possible to a real answer, and to cut
 
 ### L.2 Lean EV/Monte Carlo engine (replaces full Phase 5)
 
-- Real bid/ask pulled live for both legs of all 1,504 candidates, real fees per Section B, real net entry cost per D.2.
+- Real bid/ask pulled live for both legs of all 1,504 candidates, real fees per Section B, real net entry cost per D.2. Implemented in `pricing/run_pricing.py` (built this session) calling `pricing/ev_engine.py`'s `LeanEVEngine`.
 - IV-at-T1 modeled via a small shock band (e.g. -30%/0/+30% of today's IV) instead of a fitted historical distribution — faster, clearly labeled as a simplification, upgradeable later without changing the interface.
-- Output: net EV, rough probability-of-profit, ranked — enough to answer "is there anything here" without the full statistical rigor of v1's plan.
+- Output: net EV, rough probability-of-profit, ranked — enough to answer "is there anything here" without the full statistical rigor of v1's plan. The ranking heuristic (`expected_value * probability_of_profit`) is intentionally simple and documented as such in `pricing/run_pricing.py` — it stands in for the "OPPORTUNITY SCANNER" component diagram box for this lean pass, not a calibrated score.
+- **Remaining step:** run it. `python -m pricing.run_pricing --underlying BTC` against live Delta testnet data.
 
 ### L.3 Lean backtest + short paper trading (replaces full Phase 6/7)
 
@@ -327,12 +332,16 @@ Deferred items (full backtest matrix, dashboard, CoinSwitch/Shark, alerting) com
 - `config/settings.py` — `LIVE_TRADING` hardcoded `False`
 - `matching/schemas.py`, `engine.py`, `run_matcher.py` — real run complete: 1,504 candidates found, 68,247 rejected, persisted
 
+**Built and unit-tested against fixtures, but NOT yet run against live data:**
+- `pricing/black_scholes.py`, `ev_engine.py` — lean scenario-grid EV math; now covered by `tests/test_ev_engine.py` (added this session).
+- `pricing/run_pricing.py` (added this session) — CLI wiring `candidate_pairs` → live adapter ticker/fee calls → `LeanEVEngine` → `signals`. This has not been executed against Delta's testnet in this session (no network egress available in this working environment) — run it from an environment that has network access before treating any EV/probability numbers as real, per the Phase 5 exit criterion.
+
 **Not built yet:**
-- Pricing/EV engine (Phase 5, lean version — building next)
 - Lean backtester (Phase 6)
 - Paper trading (Phase 7)
 - Execution engine + risk/kill switch (Phase 8/9, built together)
 - Dashboard/alerting (deferred per Section L.5)
+- Standalone continuous "opportunity scanner" (the lean plan folds a one-shot ranking pass into `pricing/run_pricing.py` instead, per Section L.2)
 
 **Outstanding items, deprioritized under the fast-track plan (not resolved, not urgent):**
 1. CoinSwitch options API docs.
