@@ -217,7 +217,19 @@ class TestLeanEVEngineScenarioGrid:
         assert result.pair_id == "p1"
 
     def test_net_entry_cost_matches_documented_formula(self) -> None:
-        """Section D.2: Net entry cost = (B_short - A_long) - fees(short) - fees(long)."""
+        """
+        Section D.2: Net entry cost = (B_short - A_long) - fees(short) - fees(long).
+
+        IMPORTANT: per the contract_multiplier premium-scaling fix (Bug #2,
+        see pricing/ev_engine.py's module docstring), B_short/A_long in this
+        formula are the SCALED (per-real-contract) premiums --
+        short_bid_used * contract_multiplier, not the raw quoted values.
+        This test asserts against the scaled figures deliberately: asserting
+        against the raw short_bid/long_ask would silently pass a
+        reintroduction of Bug #2's unscaled-premium mistake, since the two
+        only coincide when contract_multiplier == 1 -- which is not Delta's
+        real BTC options contract size of 0.001.
+        """
         short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
         long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
         candidate = _make_candidate(short, long_)
@@ -231,13 +243,17 @@ class TestLeanEVEngineScenarioGrid:
         engine = LeanEVEngine(short_taker_fee_pct=short_fee_pct, long_taker_fee_pct=long_fee_pct)
         result = engine.evaluate(candidate, short_snap, long_snap)
 
-        expected_fees = short_bid * short_fee_pct + long_ask * long_fee_pct
-        expected_net_entry = (short_bid - long_ask) - expected_fees
+        short_bid_scaled = short_bid * short.contract_multiplier
+        long_ask_scaled = long_ask * long_.contract_multiplier
+        expected_fees = short_bid_scaled * short_fee_pct + long_ask_scaled * long_fee_pct
+        expected_net_entry = (short_bid_scaled - long_ask_scaled) - expected_fees
 
         assert result.fees_total == expected_fees
         assert result.net_entry_cost == expected_net_entry
-        assert result.short_bid_used == short_bid
-        assert result.long_ask_used == long_ask
+        assert result.short_bid_used == short_bid  # raw, unscaled -- as documented
+        assert result.long_ask_used == long_ask     # raw, unscaled -- as documented
+        assert result.short_bid_scaled == short_bid_scaled
+        assert result.long_ask_scaled == long_ask_scaled
 
     def test_missing_iv_falls_back_to_conservative_default_without_crashing(self) -> None:
         """ev_engine.py falls back to an 80% flat vol assumption when a
@@ -290,15 +306,19 @@ class TestGridResolution:
         )
         candidate = _make_candidate(short, long_)
 
-        # Small net debit, spot sitting exactly at the strike (maximally
-        # sensitive to which side of ATM a given scenario lands on) --
-        # realistic short-dated Delta-scale premiums and IV.
+        # Realistic RAW (per-1-BTC) premiums at these parameters -- computed
+        # via black_scholes_price(spot=65000, strike=65000, T=6h, IV=0.50)
+        # ~= 339 for the short leg, ~1696 for the long leg (150h). Using
+        # premiums near fair value with a small bid/ask spread, quoted at
+        # the correct raw scale -- NOT the tiny ~$2 figures a pre-Bug#2
+        # fixture would have used, which silently relied on premiums never
+        # being scaled by contract_multiplier in the first place.
         short_snap = _make_snapshot(
-            instrument_id="1", best_bid=Decimal("2.00"), best_ask=Decimal("2.05"),
+            instrument_id="1", best_bid=Decimal("335"), best_ask=Decimal("340"),
             iv=Decimal("0.50"), underlying_spot=Decimal("65000"), underlying_index=Decimal("65000"),
         )
         long_snap = _make_snapshot(
-            instrument_id="2", best_bid=Decimal("2.90"), best_ask=Decimal("2.95"),
+            instrument_id="2", best_bid=Decimal("1690"), best_ask=Decimal("1705"),
             iv=Decimal("0.50"), underlying_spot=Decimal("65000"), underlying_index=Decimal("65000"),
         )
 
@@ -344,13 +364,21 @@ class TestLeanEVEngineUnitConsistency:
 
     def test_ev_stays_within_a_sane_multiple_of_net_entry_cost(self) -> None:
         """
-        Before the fix, this exact scenario produced EV ~3124 against a net
+        Before Bug #1's fix, this scenario produced EV ~3124 against a net
         entry cost of ~-1.00 (a ~3000x blowup) because the unscaled payoff/
-        repricing terms swamped the correctly-scaled entry economics. After
-        the fix, EV should sit within a small, sane multiple of the entry
-        cost -- this is a regression guard against that specific unit
-        mismatch reappearing, not a claim about what "sane" EV should be in
-        general.
+        repricing terms swamped the entry economics. After Bug #2's fix
+        (short_bid/long_ask also correctly scaled by contract_multiplier),
+        EV should sit within a small, sane multiple of the entry cost -- a
+        regression guard against either direction of this unit-mismatch
+        class of bug reappearing, not a claim about what "sane" EV should be
+        in general.
+
+        Premiums here are the REALISTIC RAW (per-1-BTC) scale --
+        black_scholes_price(spot=strike=65000, T=1d, IV=1.20) ~= 1628 for
+        the short leg and ~4601 for the long leg (8d) -- not a tiny ~$2
+        figure. A ~$2 raw premium would itself only make sense if quotes
+        were already contract-scaled, which is exactly the wrong assumption
+        Bug #2 was about.
         """
         short = _make_contract(
             instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1,
@@ -362,14 +390,11 @@ class TestLeanEVEngineUnitConsistency:
         )
         candidate = _make_candidate(short, long_)
 
-        # Realistic Delta-scale premiums for a 0.001 BTC contract -- small
-        # dollar amounts, not thousands, and consistent with the multiplier
-        # above (this is the shape real live quotes actually take).
         short_snap = _make_snapshot(
-            instrument_id="1", best_bid=Decimal("2.00"), best_ask=Decimal("2.10"), iv=Decimal("1.20"),
+            instrument_id="1", best_bid=Decimal("1620"), best_ask=Decimal("1635"), iv=Decimal("1.20"),
         )
         long_snap = _make_snapshot(
-            instrument_id="2", best_bid=Decimal("2.90"), best_ask=Decimal("3.00"), iv=Decimal("1.20"),
+            instrument_id="2", best_bid=Decimal("4590"), best_ask=Decimal("4610"), iv=Decimal("1.20"),
         )
 
         engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
@@ -410,11 +435,13 @@ class TestLeanEVEngineUnitConsistency:
         )
         candidate = _make_candidate(short, long_)
 
+        # Same realistic raw-premium scale as the sanity-check test above
+        # (see its docstring for the black_scholes_price reference values).
         short_snap = _make_snapshot(
-            instrument_id="1", best_bid=Decimal("2.00"), best_ask=Decimal("2.10"), iv=Decimal("1.20"),
+            instrument_id="1", best_bid=Decimal("1620"), best_ask=Decimal("1635"), iv=Decimal("1.20"),
         )
         long_snap = _make_snapshot(
-            instrument_id="2", best_bid=Decimal("2.90"), best_ask=Decimal("3.00"), iv=Decimal("1.20"),
+            instrument_id="2", best_bid=Decimal("4590"), best_ask=Decimal("4610"), iv=Decimal("1.20"),
         )
 
         engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
@@ -426,3 +453,99 @@ class TestLeanEVEngineUnitConsistency:
             "would indicate the unit-mismatch artifact is back."
         )
         assert result.probability_of_profit < Decimal("1.0")
+
+
+class TestPremiumScalingUnitConsistency:
+    """
+    Regression tests for Bug #2 (2026-08-22): short_bid/long_ask were used
+    directly in net_entry_cost with NO contract_multiplier scaling, even
+    after Bug #1's fix correctly scaled short_payoff/v_long. This mixed
+    "raw per-1-BTC premium" (exchange-quoted scale) with "per-contract
+    payoff/value" (already scaled) in the same P&L formula -- the mirror
+    image of Bug #1, on the other operand.
+
+    Built directly from the real diagnose_pair.py finding referenced in
+    ev_engine.py's module docstring: a live Delta testnet snapshot showed a
+    deep-ITM call with best_bid=12750 against spot=77223.2, strike=64400
+    (intrinsic = 12823.2, essentially matching best_bid and mark_price).
+    That only makes sense if the quoted premium is in raw per-1-BTC terms;
+    a real 0.001-BTC-notional contract's actual cost is
+    best_bid * contract_multiplier = 12750 * 0.001 = $12.75, not $12,750.
+    """
+
+    def test_short_bid_and_long_ask_are_scaled_by_their_own_contract_multiplier(self) -> None:
+        """
+        Direct check on the EVResult's own scaled/unscaled fields: this is
+        the most literal possible regression guard for Bug #2 reappearing --
+        if someone reverts the scaling line, short_bid_scaled would equal
+        short_bid_used again and this assertion catches it immediately,
+        without needing to reason about downstream EV magnitudes.
+        """
+        short = _make_contract(
+            instrument_id="1", strike=Decimal("64400"), expiry_timestamp=_T1, settlement_timestamp=_T1,
+            contract_multiplier=Decimal("0.001"),
+        )
+        long_ = _make_contract(
+            instrument_id="2", strike=Decimal("64400"), expiry_timestamp=_T2, settlement_timestamp=_T2,
+            contract_multiplier=Decimal("0.001"),
+        )
+        candidate = _make_candidate(short, long_)
+
+        # The real diagnosed numbers, verbatim.
+        short_snap = _make_snapshot(
+            instrument_id="1", best_bid=Decimal("12750"), best_ask=Decimal("12760"),
+            iv=Decimal("0.65"), underlying_spot=Decimal("77223.2"), underlying_index=Decimal("77223.2"),
+        )
+        long_snap = _make_snapshot(
+            instrument_id="2", best_bid=Decimal("13100"), best_ask=Decimal("13120"),
+            iv=Decimal("0.65"), underlying_spot=Decimal("77223.2"), underlying_index=Decimal("77223.2"),
+        )
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert result.short_bid_used == Decimal("12750")
+        assert result.short_bid_scaled == Decimal("12750") * Decimal("0.001")
+        assert result.long_ask_used == Decimal("13120")
+        assert result.long_ask_scaled == Decimal("13120") * Decimal("0.001")
+
+    def test_net_entry_cost_on_real_diagnosed_case_is_a_realistic_dollar_figure(self) -> None:
+        """
+        Before Bug #2's fix, net_entry_cost on this exact real-world case
+        would have been (12750 - 13120) - fees = roughly -370 -- an absurd
+        per-contract dollar figure for a 0.001 BTC notional contract. After
+        the fix it must land in a realistic per-contract range (single- to
+        low-double-digit dollars for a deep-ITM BTC option at this spot),
+        not the raw per-1-BTC scale.
+        """
+        short = _make_contract(
+            instrument_id="1", strike=Decimal("64400"), expiry_timestamp=_T1, settlement_timestamp=_T1,
+            contract_multiplier=Decimal("0.001"),
+        )
+        long_ = _make_contract(
+            instrument_id="2", strike=Decimal("64400"), expiry_timestamp=_T2, settlement_timestamp=_T2,
+            contract_multiplier=Decimal("0.001"),
+        )
+        candidate = _make_candidate(short, long_)
+
+        short_snap = _make_snapshot(
+            instrument_id="1", best_bid=Decimal("12750"), best_ask=Decimal("12760"),
+            iv=Decimal("0.65"), underlying_spot=Decimal("77223.2"), underlying_index=Decimal("77223.2"),
+        )
+        long_snap = _make_snapshot(
+            instrument_id="2", best_bid=Decimal("13100"), best_ask=Decimal("13120"),
+            iv=Decimal("0.65"), underlying_spot=Decimal("77223.2"), underlying_index=Decimal("77223.2"),
+        )
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        # The raw (pre-fix) figure would have been roughly (12750-13120) =
+        # -370 before fees. A correctly-scaled net_entry_cost for a 0.001
+        # multiplier contract must be orders of magnitude smaller than that.
+        assert abs(result.net_entry_cost) < Decimal("100"), (
+            f"net_entry_cost={result.net_entry_cost} is still on the raw "
+            f"per-1-BTC scale (~hundreds) rather than the correctly-scaled "
+            f"per-contract scale (~tens) -- Bug #2 may have reappeared."
+        )
+        assert result.worst_case_pnl <= result.expected_value <= result.best_case_pnl
