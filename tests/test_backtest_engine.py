@@ -187,3 +187,87 @@ class TestLeanBacktesterLeggingFailure:
         result_a = engine.simulate_pair(candidate, short_ticks, long_ticks, _NOW)
         result_b = engine.simulate_pair(candidate, short_ticks, long_ticks, _NOW)
         assert result_a.status == result_b.status
+
+
+class TestFindEntryPerformance:
+    """
+    Regression tests for the O(n*m) -> O(n log m) fix in
+    LeanBacktester._find_entry (2026-08-22), found when
+    `python -m backtest.run_backtest --underlying BTC` slowed to a crawl on
+    real data -- candidates with thousands of ticks per leg, especially ones
+    with NO match at all (the original nested loop's worst case: full n*m
+    scan before giving up), were taking seconds each.
+    """
+
+    def test_large_no_match_input_completes_quickly(self) -> None:
+        """
+        5,000 ticks per leg, deliberately interleaved so NO short/long tick
+        pair falls within the entry tolerance window -- this is exactly the
+        worst case that made the original nested loop scan the full n*m
+        product. Should now resolve via bisect in well under a second; the
+        naive O(n*m) version of this same input (25 million comparisons)
+        would take multiple seconds in pure Python.
+        """
+        import time
+
+        base = _NOW - timedelta(days=30)
+        tolerance = timedelta(seconds=60)
+
+        # Short ticks every 60s starting at base; long ticks every 60s but
+        # offset by (tolerance + 1s) so no pair ever lands inside the window.
+        short_ticks = [
+            HistoricalTick(ts=base + timedelta(seconds=60 * i), best_bid=Decimal("2.00"), best_ask=Decimal("2.10"), index_price=Decimal("65000"))
+            for i in range(5000)
+        ]
+        long_ticks = [
+            HistoricalTick(
+                ts=base + timedelta(seconds=60 * i) + tolerance + timedelta(seconds=1),
+                best_bid=Decimal("2.90"), best_ask=Decimal("3.00"), index_price=Decimal("65000"),
+            )
+            for i in range(5000)
+        ]
+
+        start = time.monotonic()
+        result = LeanBacktester._find_entry(short_ticks, long_ticks)
+        elapsed = time.monotonic() - start
+
+        assert result == (None, None)
+        assert elapsed < 1.0, (
+            f"_find_entry took {elapsed:.2f}s on a 5,000x5,000 no-match input -- "
+            f"expected well under 1s with O(n log m) bisect search. If this is "
+            f"slow again, check that the nested-loop O(n*m) version wasn't "
+            f"reintroduced."
+        )
+
+    def test_finds_correct_match_in_large_input(self) -> None:
+        """
+        Correctness check alongside the performance check: bisect must still
+        find the right tick pair, not just be fast. Plants exactly one valid
+        match in the middle of large, otherwise-non-matching lists.
+        """
+        base = _NOW - timedelta(days=30)
+
+        short_ticks = [
+            HistoricalTick(ts=base + timedelta(minutes=5 * i), best_bid=Decimal("2.00"), best_ask=Decimal("2.10"), index_price=Decimal("65000"))
+            for i in range(2000)
+        ]
+        long_ticks = [
+            HistoricalTick(ts=base + timedelta(minutes=5 * i) + timedelta(hours=1), best_bid=Decimal("2.90"), best_ask=Decimal("3.00"), index_price=Decimal("65000"))
+            for i in range(2000)
+        ]
+
+        # Plant one real match: a long tick 30 seconds after short tick #1000
+        # (well within the 60s tolerance), distinguishable by a unique price.
+        planted_short = short_ticks[1000]
+        planted_long = HistoricalTick(
+            ts=planted_short.ts + timedelta(seconds=30),
+            best_bid=Decimal("999.99"), best_ask=Decimal("888.88"), index_price=Decimal("65000"),
+        )
+        long_ticks.insert(1000, planted_long)
+        long_ticks.sort(key=lambda t: t.ts)
+
+        found_short, found_long = LeanBacktester._find_entry(short_ticks, long_ticks)
+
+        assert found_short is not None and found_long is not None
+        assert found_short.ts == planted_short.ts
+        assert found_long.best_ask == Decimal("888.88")
