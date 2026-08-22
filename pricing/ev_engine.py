@@ -10,13 +10,9 @@ WHY A GRID, NOT JUST AN IV SHOCK BAND: the short leg's settlement payoff
 IV at all -- IV only affects the long leg's repriced value. A model that
 only shocks IV at a fixed spot price would silently ignore the dominant
 source of P&L variance for this strategy (the short leg's own payoff). So
-this engine crosses a small underlying-price grid (5 points, discretized
-from a lognormal move over the time-to-T1 using the short leg's own IV as
-the move-size estimate) with a small IV-shock grid (3 points) -- 15
-scenarios total. This is still far cheaper than a real Monte Carlo (Section
-D.4/Phase 5 v1 called for thousands of paths) but keeps the one relationship
-that actually matters: short-leg payoff depends on where the underlying
-actually goes.
+this engine crosses an underlying-price grid (21 points -- see "GRID
+RESOLUTION FIX" below for why 21, not the original 5) with a small IV-shock
+grid (3 points).
 
 WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
   - Does not fit sigma_effective_at_T1 to historical IV term-structure
@@ -24,40 +20,41 @@ WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
     shock band around it.
   - Does not model IV smile/skew across strikes.
   - Scenario weights are a discretized-normal approximation, not a properly
-    calibrated risk-neutral distribution.
+    calibrated risk-neutral distribution -- even at 21 points, this is still
+    a deterministic grid, not a real Monte Carlo or closed-form probability.
   - Does not account for legging risk, slippage beyond a flat assumption,
-    or partial fills -- those are Phase 8/9 concerns (execution engine +
-    risk engine), not this pricing step.
-Every EVResult carries a `model_notes` field stating this explicitly so a
-result is never mistaken for more rigorous than it is.
+    or partial fills -- those are Phase 8/9 concerns.
+Every EVResult carries a `model_notes` field stating this explicitly.
 
-BUG FOUND + FIXED post-Phase-5-smoke-run (2026-08-21): settlement_payoff()
-and black_scholes_price() both operate in raw underlying-price terms (e.g.
-dollars per 1 BTC) -- they have no notion of contract size. short_bid and
-long_ask, by contrast, are real exchange-quoted premiums, which are already
-scaled to one contract's notional via OptionContract.contract_multiplier
-(e.g. 0.001 BTC/contract on Delta). Before this fix, short_payoff and
-v_long were combined directly with net_entry_cost with no multiplier
-applied, mixing "dollars per contract" with "dollars per 1 BTC" -- a scale
-error of roughly 1/contract_multiplier. Two symptoms in the first live run
-against all 1,504 candidates traced back to exactly this:
-  1. EV magnitudes far too large relative to net entry cost (e.g. EV=7613
-     against a net entry cost of -1505) -- the unscaled payoff/repricing
-     terms dominated the correctly-scaled entry economics.
-  2. P(profit)=1.0 exactly, repeatedly, for the top-ranked (mostly
-     exact-strike, same-exchange calendar spread) candidates. For an
-     exact-strike calendar spread, short_payoff and the long leg's intrinsic
-     value at T1 are identical, so (v_long - short_payoff) is just the long
-     leg's remaining time value -- structurally >= 0 for any European option
-     with positive time-to-expiry. Left unscaled, that always-non-negative
-     term swamped net_entry_cost in every one of the 15 grid scenarios,
-     making every exact-strike candidate look risk-free. That is a modeling
-     artifact, not a real edge.
-Fix: multiply short_payoff by short_contract.contract_multiplier and
-v_long by long_contract.contract_multiplier before combining them with
-net_entry_cost, so every term in the P&L formula is in the same units
-(dollars per contract). See tests/test_ev_engine.py::TestLeanEVEngineUnitConsistency
-for the regression test that would have caught this.
+BUG FOUND + FIXED post-Phase-5-smoke-run (2026-08-21): contract_multiplier
+was loaded but never applied to short_payoff/v_long, mixing "dollars per
+contract" (real quoted premiums) with "dollars per 1 BTC" (raw intrinsic/BS
+values) -- roughly a 1/contract_multiplier scale error. Fixed by scaling
+each leg's payoff/value by its OWN contract_multiplier before combining with
+net_entry_cost. See tests/test_ev_engine.py::TestLeanEVEngineUnitConsistency.
+
+GRID RESOLUTION FIX (2026-08-22): after the multiplier fix, the first real
+re-run against all priced candidates (330 of 1,504 had live executable data)
+showed `P(profit)` landing at EXACTLY 1.0 or EXACTLY 0.0 for all 330 --
+zero candidates with a probability strictly between 0 and 1. Root cause:
+these are short-dated options (6-150 hours to expiry), so
+sigma_move = IV * sqrt(time_to_T1) is naturally small (observed range:
+~0.01-0.12, i.e. a 1-12% one-std price move). The original 5-point grid
+(z in {-2,-1,0,1,2}) sampled too coarsely relative to that narrow range to
+ever land a scenario near a given candidate's actual payoff breakeven --
+every one of the 5x3=15 scenarios for a given candidate ended up on the same
+side of profitable/unprofitable, so the weighted probability collapsed to
+0 or 1 regardless of how close the true (continuous) probability actually
+was. This is NOT the same class of bug as the multiplier issue -- it's a
+disclosed lean-model limitation (see docstring above: "discretized-normal
+approximation, not a properly calibrated ... distribution") that turned out
+to bite harder than expected on real short-dated data. Fix: widened the
+price grid from 5 to 21 points (z from -3.0 to 3.0, evenly spaced) so
+scenarios land close enough to a candidate's breakeven to produce genuine
+fractional probabilities. This does NOT make the model a real Monte Carlo
+or closed-form probability -- it is still a discrete approximation, now
+just finer. See tests/test_ev_engine.py::TestGridResolution for the
+regression test that would have caught the original coarse-grid collapse.
 """
 
 from __future__ import annotations
@@ -74,10 +71,17 @@ from normalization.schemas import MarketSnapshot, OptionType
 from pricing.black_scholes import OptionKind, black_scholes_price, settlement_payoff
 
 # Underlying-price scenario grid, in standard-deviation units of the
-# lognormal move over time-to-T1. 5 points is a coarse discretization of a
-# continuous distribution -- documented as a lean-plan simplification, not
-# presented as equivalent to a real Monte Carlo run.
-_PRICE_GRID_Z = (-2.0, -1.0, 0.0, 1.0, 2.0)
+# lognormal move over time-to-T1. 21 points spanning +/-3 sigma -- widened
+# from an original 5-point grid per the "GRID RESOLUTION FIX" note above.
+# Still a discrete approximation of a continuous distribution, not a real
+# Monte Carlo run -- just fine enough not to collapse every short-dated
+# candidate's probability to exactly 0 or 1.
+_PRICE_GRID_POINTS = 21
+_PRICE_GRID_RANGE_SIGMA = 3.0
+_PRICE_GRID_Z: tuple[float, ...] = tuple(
+    -_PRICE_GRID_RANGE_SIGMA + (2 * _PRICE_GRID_RANGE_SIGMA) * i / (_PRICE_GRID_POINTS - 1)
+    for i in range(_PRICE_GRID_POINTS)
+)
 
 # IV shock grid applied to the long leg's repricing at each price scenario.
 _IV_SHOCK_GRID = (-0.30, 0.0, 0.30)
@@ -89,8 +93,9 @@ def _grid_weights(z_points: tuple[float, ...]) -> list[float]:
     """
     Discretized-normal weights for the given z-score grid points, normalized
     to sum to 1.0. This is a simple pdf-at-point-normalized-by-sum
-    approximation, not a proper Gaussian quadrature -- adequate for a lean
-    5-point grid, not something to rely on for tail-risk precision.
+    approximation, not a proper Gaussian quadrature -- adequate at 21 points
+    for a lean model, not something to rely on for precise tail-risk (VaR/ES)
+    figures without further validation.
     """
     raw = [norm.pdf(z) for z in z_points]
     total = sum(raw)
@@ -109,28 +114,20 @@ class EVResult:
     short_bid_used: Decimal
     long_ask_used: Decimal
     fees_total: Decimal
-    # --- Diagnostic fields (added 2026-08-22) -------------------------------
+    # --- Diagnostic fields -------------------------------
     # Not used in the P&L math itself -- these exist so a caller (e.g.
-    # run_pricing.py's ranked printout) can tell WHY a result landed at
-    # P(profit)=1.0 or 0.0 exactly, instead of guessing. A hard 100%/0% split
-    # with nothing in between across many candidates is a signal worth
-    # checking, not necessarily a bug -- these fields make that checkable.
+    # run_pricing.py's ranked printout) can tell WHY a result landed where
+    # it did, instead of guessing.
     time_to_short_expiry_hours: float = 0.0
-    # sigma_move is the fractional 1-standard-deviation price move the price
-    # grid explored over time_to_short_expiry_hours (base_iv * sqrt(T)). If
-    # this is tiny (near-zero time-to-expiry), the +/-2 sigma grid barely
-    # moves the price at all, so the scenario grid degenerates toward a
-    # single point and can't discover a losing (or winning) scenario even if
-    # one exists -- that's a modeling-resolution gap, not evidence the trade
-    # itself is risk-free or hopeless.
     sigma_move: float = 0.0
     base_iv_used: float = 0.0
     model_notes: tuple[str, ...] = field(default_factory=lambda: (
-        "Lean scenario grid (Section L.2), not a full Monte Carlo or "
-        "historical-IV-fitted model -- see pricing/ev_engine.py module "
-        "docstring for exactly what's simplified. Payoff/repricing terms "
-        "are scaled by each leg's own contract_multiplier so they're in "
-        "the same per-contract units as the quoted premiums.",
+        "Lean scenario grid (Section L.2, 21-point price grid x 3-point IV "
+        "shock), not a full Monte Carlo or historical-IV-fitted model -- see "
+        "pricing/ev_engine.py module docstring for exactly what's "
+        "simplified. Payoff/repricing terms are scaled by each leg's own "
+        "contract_multiplier so they're in the same per-contract units as "
+        "the quoted premiums.",
     ))
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -226,16 +223,9 @@ class LeanEVEngine:
 
         for z, p_weight in zip(_PRICE_GRID_Z, price_weights):
             # Lognormal price move: S_T1 = S_now * exp(z * sigma_move - 0.5*sigma_move^2)
-            # (the drift-adjustment term keeps E[S_T1] ~= S_now under this
-            # discretization, consistent with a risk-neutral-ish assumption --
-            # again, a simplification, not a calibrated forward price).
             move_factor = math.exp(z * sigma_move - 0.5 * sigma_move**2) if sigma_move > 0 else 1.0
             s_t1 = spot_now * Decimal(str(move_factor))
 
-            # settlement_payoff() returns the payoff per 1 unit of underlying
-            # (e.g. per 1 BTC) -- scale by the short leg's own
-            # contract_multiplier so it's in the same "per contract" units as
-            # short_bid/net_entry_cost. See module docstring's BUG FOUND note.
             short_payoff_raw = settlement_payoff(s_t1, short.strike, short_kind)
             short_payoff = short_payoff_raw * short.contract_multiplier
 
@@ -249,18 +239,7 @@ class LeanEVEngine:
                     risk_free_rate=self._risk_free_rate,
                     option_kind=long_kind,
                 )
-                # Same unit fix as short_payoff above, using the long leg's
-                # own contract_multiplier (in practice equal to the short
-                # leg's for a same-underlying calendar spread, but each leg
-                # is scaled by its own contract spec rather than assuming
-                # they match, per architecture.md's adapter-isolation rule).
                 v_long = v_long_raw * long_.contract_multiplier
-
-                # Exit fee on the long leg's repriced value at T1 -- short
-                # leg's fee already accounted for in net_entry_cost (Section
-                # D.2); this exit_fee is Section D.4's "exit_fees(long)" term.
-                # Computed from the already-scaled v_long so the fee itself
-                # is in per-contract dollars too.
                 exit_fee = v_long * self._long_fee_pct
 
                 pnl = net_entry_cost - short_payoff + v_long - exit_fee
