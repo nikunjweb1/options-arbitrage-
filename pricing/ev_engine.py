@@ -11,8 +11,7 @@ IV at all -- IV only affects the long leg's repriced value. A model that
 only shocks IV at a fixed spot price would silently ignore the dominant
 source of P&L variance for this strategy (the short leg's own payoff). So
 this engine crosses an underlying-price grid (21 points -- see "GRID
-RESOLUTION FIX" below for why 21, not the original 5) with a small IV-shock
-grid (3 points).
+RESOLUTION FIX" below) with a small IV-shock grid (3 points).
 
 WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
   - Does not fit sigma_effective_at_T1 to historical IV term-structure
@@ -20,41 +19,47 @@ WHAT THIS DOES NOT DO (be honest about the gap vs. v1's full plan):
     shock band around it.
   - Does not model IV smile/skew across strikes.
   - Scenario weights are a discretized-normal approximation, not a properly
-    calibrated risk-neutral distribution -- even at 21 points, this is still
-    a deterministic grid, not a real Monte Carlo or closed-form probability.
+    calibrated risk-neutral distribution.
   - Does not account for legging risk, slippage beyond a flat assumption,
     or partial fills -- those are Phase 8/9 concerns.
 Every EVResult carries a `model_notes` field stating this explicitly.
 
-BUG FOUND + FIXED post-Phase-5-smoke-run (2026-08-21): contract_multiplier
-was loaded but never applied to short_payoff/v_long, mixing "dollars per
-contract" (real quoted premiums) with "dollars per 1 BTC" (raw intrinsic/BS
-values) -- roughly a 1/contract_multiplier scale error. Fixed by scaling
-each leg's payoff/value by its OWN contract_multiplier before combining with
-net_entry_cost. See tests/test_ev_engine.py::TestLeanEVEngineUnitConsistency.
+BUG #1 FOUND + FIXED (2026-08-21): contract_multiplier was loaded but never
+applied to short_payoff/v_long. Fixed by scaling each leg's payoff/value by
+its own contract_multiplier. See TestLeanEVEngineUnitConsistency.
 
-GRID RESOLUTION FIX (2026-08-22): after the multiplier fix, the first real
-re-run against all priced candidates (330 of 1,504 had live executable data)
-showed `P(profit)` landing at EXACTLY 1.0 or EXACTLY 0.0 for all 330 --
-zero candidates with a probability strictly between 0 and 1. Root cause:
-these are short-dated options (6-150 hours to expiry), so
-sigma_move = IV * sqrt(time_to_T1) is naturally small (observed range:
-~0.01-0.12, i.e. a 1-12% one-std price move). The original 5-point grid
-(z in {-2,-1,0,1,2}) sampled too coarsely relative to that narrow range to
-ever land a scenario near a given candidate's actual payoff breakeven --
-every one of the 5x3=15 scenarios for a given candidate ended up on the same
-side of profitable/unprofitable, so the weighted probability collapsed to
-0 or 1 regardless of how close the true (continuous) probability actually
-was. This is NOT the same class of bug as the multiplier issue -- it's a
-disclosed lean-model limitation (see docstring above: "discretized-normal
-approximation, not a properly calibrated ... distribution") that turned out
-to bite harder than expected on real short-dated data. Fix: widened the
-price grid from 5 to 21 points (z from -3.0 to 3.0, evenly spaced) so
-scenarios land close enough to a candidate's breakeven to produce genuine
-fractional probabilities. This does NOT make the model a real Monte Carlo
-or closed-form probability -- it is still a discrete approximation, now
-just finer. See tests/test_ev_engine.py::TestGridResolution for the
-regression test that would have caught the original coarse-grid collapse.
+BUG #2 FOUND + FIXED (2026-08-22, widened grid, symptom persisted): after
+Bug #1's fix, P(profit) was still landing at exactly 0.0 or 1.0 for all 330
+live-priced candidates, even after widening the price grid from 5 to 21
+points. Root cause, found via pricing/diagnose_pair.py against real Delta
+testnet data: exchange-quoted best_bid/best_ask are in RAW per-1-BTC terms
+-- the SAME scale as spot/strike -- not already scaled to one contract's
+notional. Confirmed directly: a deep-ITM call showed best_bid=12750 against
+spot=77223.2, strike=64400 -- intrinsic value (spot-strike) = 12823.2, which
+best_bid (12750) and mark_price (12823.5) both sit right next to. That only
+makes sense if the quoted price is per-1-BTC (matching Delta's own displayed
+scale), not per-contract -- a real 0.001-BTC-notional contract's actual cost
+is best_bid * contract_multiplier = 12750 * 0.001 = $12.75, not $12,750.
+
+Bug #1's fix correctly scaled short_payoff/v_long by contract_multiplier,
+but never scaled short_bid/long_ask (and therefore net_entry_cost) the same
+way -- based on the wrong assumption that quoted premiums were already
+contract-scaled. That left net_entry_cost roughly 1/contract_multiplier too
+LARGE relative to the (correctly scaled) payoff/repricing terms -- the
+opposite-direction version of Bug #1, on the other side of the same P&L
+formula. That's why net_entry_cost (e.g. ~252) totally dwarfed any realistic
+payoff swing (a few dollars) regardless of grid resolution -- Bug #2 was
+never actually a resolution problem, widening the grid in the "GRID
+RESOLUTION FIX" commit was necessary-but-insufficient, treating a symptom
+without yet having found this root cause.
+
+FIX: short_bid and long_ask are now scaled by their own leg's
+contract_multiplier BEFORE computing gross_entry_credit/fees/net_entry_cost,
+exactly the same treatment already applied to short_payoff/v_long -- so
+every dollar figure in the P&L formula is consistently in "per one real
+exchange contract" terms. See
+tests/test_ev_engine.py::TestPremiumScalingUnitConsistency for the
+regression test built directly from the real diagnose_pair.py output above.
 """
 
 from __future__ import annotations
@@ -71,11 +76,7 @@ from normalization.schemas import MarketSnapshot, OptionType
 from pricing.black_scholes import OptionKind, black_scholes_price, settlement_payoff
 
 # Underlying-price scenario grid, in standard-deviation units of the
-# lognormal move over time-to-T1. 21 points spanning +/-3 sigma -- widened
-# from an original 5-point grid per the "GRID RESOLUTION FIX" note above.
-# Still a discrete approximation of a continuous distribution, not a real
-# Monte Carlo run -- just fine enough not to collapse every short-dated
-# candidate's probability to exactly 0 or 1.
+# lognormal move over time-to-T1. 21 points spanning +/-3 sigma.
 _PRICE_GRID_POINTS = 21
 _PRICE_GRID_RANGE_SIGMA = 3.0
 _PRICE_GRID_Z: tuple[float, ...] = tuple(
@@ -90,13 +91,9 @@ _RISK_FREE_RATE = 0.0  # crypto options: no natural risk-free rate; treated as 0
 
 
 def _grid_weights(z_points: tuple[float, ...]) -> list[float]:
-    """
-    Discretized-normal weights for the given z-score grid points, normalized
-    to sum to 1.0. This is a simple pdf-at-point-normalized-by-sum
-    approximation, not a proper Gaussian quadrature -- adequate at 21 points
-    for a lean model, not something to rely on for precise tail-risk (VaR/ES)
-    figures without further validation.
-    """
+    """Discretized-normal weights for the given z-score grid points,
+    normalized to sum to 1.0. A simple pdf-at-point-normalized-by-sum
+    approximation, not a proper Gaussian quadrature."""
     raw = [norm.pdf(z) for z in z_points]
     total = sum(raw)
     return [w / total for w in raw]
@@ -111,23 +108,20 @@ class EVResult:
     worst_case_pnl: Decimal
     best_case_pnl: Decimal
     scenario_count: int
-    short_bid_used: Decimal
-    long_ask_used: Decimal
-    fees_total: Decimal
-    # --- Diagnostic fields -------------------------------
-    # Not used in the P&L math itself -- these exist so a caller (e.g.
-    # run_pricing.py's ranked printout) can tell WHY a result landed where
-    # it did, instead of guessing.
+    short_bid_used: Decimal  # raw quoted premium (per-1-BTC terms), NOT scaled -- see short_bid_scaled
+    long_ask_used: Decimal   # raw quoted premium (per-1-BTC terms), NOT scaled -- see long_ask_scaled
+    short_bid_scaled: Decimal = Decimal("0")  # short_bid_used * short leg's contract_multiplier -- actual per-contract cost
+    long_ask_scaled: Decimal = Decimal("0")   # long_ask_used * long leg's contract_multiplier -- actual per-contract cost
+    fees_total: Decimal = Decimal("0")
     time_to_short_expiry_hours: float = 0.0
     sigma_move: float = 0.0
     base_iv_used: float = 0.0
     model_notes: tuple[str, ...] = field(default_factory=lambda: (
         "Lean scenario grid (Section L.2, 21-point price grid x 3-point IV "
-        "shock), not a full Monte Carlo or historical-IV-fitted model -- see "
-        "pricing/ev_engine.py module docstring for exactly what's "
-        "simplified. Payoff/repricing terms are scaled by each leg's own "
-        "contract_multiplier so they're in the same per-contract units as "
-        "the quoted premiums.",
+        "shock). ALL dollar figures (premiums, payoffs, repricing) are "
+        "scaled by each leg's own contract_multiplier to real per-contract "
+        "terms -- see pricing/ev_engine.py module docstring, Bug #2, for "
+        "why this needed fixing on the premium side specifically.",
     ))
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -170,13 +164,21 @@ class LeanEVEngine:
                 f"mark price is never substituted for a missing bid/ask."
             )
 
-        short_bid = short_snapshot.best_bid
-        long_ask = long_snapshot.best_ask
+        short = candidate.short_contract
+        long_ = candidate.long_contract
+
+        short_bid_raw = short_snapshot.best_bid
+        long_ask_raw = long_snapshot.best_ask
 
         # -- Section D.2: entry economics --------------------------------------
-        # short_bid/long_ask are real exchange-quoted premiums -- already
-        # scaled to one contract's notional by the exchange itself. Nothing
-        # here needs contract_multiplier applied a second time.
+        # BUG #2 FIX: short_bid_raw/long_ask_raw are quoted in raw per-1-BTC
+        # terms (same scale as spot/strike) per the diagnose_pair.py finding
+        # in the module docstring -- NOT already scaled to one contract's
+        # notional. Scale each leg's premium by its OWN contract_multiplier
+        # before computing entry economics, matching the treatment already
+        # applied to short_payoff/v_long below.
+        short_bid = short_bid_raw * short.contract_multiplier
+        long_ask = long_ask_raw * long_.contract_multiplier
 
         gross_entry_credit = short_bid - long_ask
         short_fee = short_bid * self._short_fee_pct
@@ -186,12 +188,6 @@ class LeanEVEngine:
 
         # -- Section D.3/D.4: scenario grid over price x IV shock --------------
 
-        short = candidate.short_contract
-        long_ = candidate.long_contract
-
-        # Time to T1 (short expiry), in years, from now -- this determines
-        # both the price-move magnitude for the grid and how much life the
-        # long leg has left at T1.
         now = datetime.now(timezone.utc)
         time_to_T1_years = max(
             (short.expiry_timestamp - now).total_seconds() / (365 * 24 * 3600), 0.0
@@ -200,10 +196,6 @@ class LeanEVEngine:
             (long_.expiry_timestamp - short.expiry_timestamp).total_seconds() / (365 * 24 * 3600), 0.0
         )
 
-        # Use the short leg's own observed IV as the move-size estimate for
-        # the price grid -- if IV is missing (Delta didn't return one),
-        # fall back to a conservative flat 80% annualized vol assumption for
-        # crypto options rather than dividing by zero or crashing the batch.
         base_iv = float(short_snapshot.iv) if short_snapshot.iv is not None and short_snapshot.iv > 0 else 0.80
 
         spot_now = short_snapshot.underlying_spot or short_snapshot.underlying_index
@@ -219,10 +211,9 @@ class LeanEVEngine:
         short_kind = OptionKind.CALL if short.option_type == OptionType.CALL else OptionKind.PUT
         long_kind = OptionKind.CALL if long_.option_type == OptionType.CALL else OptionKind.PUT
 
-        pnl_scenarios: list[tuple[Decimal, float]] = []  # (pnl, combined_weight)
+        pnl_scenarios: list[tuple[Decimal, float]] = []
 
         for z, p_weight in zip(_PRICE_GRID_Z, price_weights):
-            # Lognormal price move: S_T1 = S_now * exp(z * sigma_move - 0.5*sigma_move^2)
             move_factor = math.exp(z * sigma_move - 0.5 * sigma_move**2) if sigma_move > 0 else 1.0
             s_t1 = spot_now * Decimal(str(move_factor))
 
@@ -261,8 +252,10 @@ class LeanEVEngine:
             worst_case_pnl=worst_case,
             best_case_pnl=best_case,
             scenario_count=len(pnl_scenarios),
-            short_bid_used=short_bid,
-            long_ask_used=long_ask,
+            short_bid_used=short_bid_raw,
+            long_ask_used=long_ask_raw,
+            short_bid_scaled=short_bid,
+            long_ask_scaled=long_ask,
             fees_total=fees_total,
             time_to_short_expiry_hours=time_to_T1_years * 365 * 24,
             sigma_move=sigma_move,
