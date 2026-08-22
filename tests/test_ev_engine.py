@@ -194,7 +194,7 @@ class TestLeanEVEngineFailClosed:
 
 
 class TestLeanEVEngineScenarioGrid:
-    def test_basic_evaluate_produces_15_scenario_grid_with_ev_within_bounds(self) -> None:
+    def test_basic_evaluate_produces_full_scenario_grid_with_ev_within_bounds(self) -> None:
         short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
         long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
         candidate = _make_candidate(short, long_)
@@ -205,8 +205,10 @@ class TestLeanEVEngineScenarioGrid:
         engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
         result = engine.evaluate(candidate, short_snap, long_snap)
 
-        # 5 price points x 3 IV-shock points, per ev_engine.py's documented grid
-        assert result.scenario_count == 15
+        # 21 price points x 3 IV-shock points, per ev_engine.py's documented
+        # grid (widened from 5 points -- see "GRID RESOLUTION FIX" in the
+        # module docstring).
+        assert result.scenario_count == 63
         assert Decimal("0") <= result.probability_of_profit <= Decimal("1")
         # EV is a weighted average of the scenario P&Ls, so it must fall
         # within [worst_case, best_case] -- this is a structural guarantee,
@@ -250,8 +252,78 @@ class TestLeanEVEngineScenarioGrid:
         engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
         result = engine.evaluate(candidate, short_snap, long_snap)
 
-        assert result.scenario_count == 15
+        assert result.scenario_count == 63
         assert result.model_notes  # always carries the lean-model disclosure
+
+
+class TestGridResolution:
+    """
+    Regression tests for the coarse-grid P(profit) collapse found on the
+    first real re-run against 330 live-priced candidates after the
+    contract_multiplier fix (2026-08-22): every single one landed at
+    P(profit) EXACTLY 0.0 or 1.0, with zero candidates strictly in between.
+    Root cause and fix are in ev_engine.py's "GRID RESOLUTION FIX" docstring
+    note -- summary: short-dated options have a small sigma_move, and the
+    original 5-point price grid was too coarse to land any scenario near a
+    typical candidate's payoff breakeven.
+    """
+
+    def test_short_dated_close_to_the_money_candidate_produces_fractional_probability(self) -> None:
+        """
+        Constructs a short-dated (6-hour), near-the-money candidate sized so
+        a real trade would plausibly win in some price scenarios and lose in
+        others -- the exact shape of candidate that produced an incorrect
+        hard 0/1 split on real data before the grid was widened.
+        """
+        short_expiry = _NOW + timedelta(hours=6)
+        long_expiry = _NOW + timedelta(hours=150)
+
+        short = _make_contract(
+            instrument_id="1", strike=Decimal("65000"),
+            expiry_timestamp=short_expiry, settlement_timestamp=short_expiry,
+            contract_multiplier=Decimal("0.001"),
+        )
+        long_ = _make_contract(
+            instrument_id="2", strike=Decimal("65000"),
+            expiry_timestamp=long_expiry, settlement_timestamp=long_expiry,
+            contract_multiplier=Decimal("0.001"),
+        )
+        candidate = _make_candidate(short, long_)
+
+        # Small net debit, spot sitting exactly at the strike (maximally
+        # sensitive to which side of ATM a given scenario lands on) --
+        # realistic short-dated Delta-scale premiums and IV.
+        short_snap = _make_snapshot(
+            instrument_id="1", best_bid=Decimal("2.00"), best_ask=Decimal("2.05"),
+            iv=Decimal("0.50"), underlying_spot=Decimal("65000"), underlying_index=Decimal("65000"),
+        )
+        long_snap = _make_snapshot(
+            instrument_id="2", best_bid=Decimal("2.90"), best_ask=Decimal("2.95"),
+            iv=Decimal("0.50"), underlying_spot=Decimal("65000"), underlying_index=Decimal("65000"),
+        )
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert Decimal("0") < result.probability_of_profit < Decimal("1"), (
+            f"P(profit)={result.probability_of_profit} landed exactly at 0 or 1 for a "
+            f"near-the-money, short-dated candidate -- this is the exact failure mode "
+            f"the 21-point grid was supposed to fix. sigma_move={result.sigma_move}, "
+            f"hrs_to_expiry={result.time_to_short_expiry_hours}."
+        )
+
+    def test_scenario_count_reflects_widened_grid(self) -> None:
+        short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
+        long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
+        candidate = _make_candidate(short, long_)
+
+        short_snap = _make_snapshot(instrument_id="1")
+        long_snap = _make_snapshot(instrument_id="2")
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert result.scenario_count == 63  # 21 price points x 3 IV-shock points
 
 
 class TestLeanEVEngineUnitConsistency:
@@ -321,7 +393,7 @@ class TestLeanEVEngineUnitConsistency:
 
         What the multiplier bug did was inflate that time-value term to a
         scale that swamped a realistically-sized net debit in every one of
-        the 15 grid scenarios, making every exact-strike candidate look
+        the grid scenarios, making every exact-strike candidate look
         risk-free. With premiums and payoffs on the same (correct) scale,
         a real net debit should be able to exceed the shrinking time value
         in the tail scenarios (large moves away from the strike), producing
