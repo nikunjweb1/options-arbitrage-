@@ -27,6 +27,7 @@ in the pricing engine.
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -242,16 +243,49 @@ class LeanBacktester:
         _ENTRY_MATCH_TOLERANCE_SEC. This is the single, simplest entry rule
         the lean plan calls for (Section G.2: "one entry threshold") -- not
         a sweep over multiple candidate entry times.
+
+        PERFORMANCE FIX (2026-08-22): originally a naive nested loop over
+        every (short_tick, long_tick) pair -- O(n*m). For candidates whose
+        legs have thousands of collected ticks (long-lived contracts with
+        continuous WebSocket capture per collectors/realtime_collector.py),
+        and especially for candidates where NO match exists at all (worst
+        case: the full n*m product gets scanned before giving up), this made
+        individual candidates take seconds each, and the whole backtest run
+        slow to a crawl partway through -- exactly the symptom reported
+        running `python -m backtest.run_backtest --underlying BTC`.
+
+        Since both short_sorted and long_sorted are already sorted by
+        timestamp (guaranteed by the caller, simulate_pair), this is now a
+        binary search per short tick: for each short tick's tolerance
+        window, bisect into the long-leg timestamp list to find the window
+        boundaries in O(log m), instead of scanning every long tick. Overall
+        complexity: O(n log m) instead of O(n*m) -- the same result (first
+        short tick, by time, with any executable long tick inside its
+        tolerance window), just found without the redundant scanning. See
+        tests/test_backtest_engine.py::TestFindEntryPerformance for the
+        regression test that verifies this stays fast on large inputs.
         """
+        short_executable = [s for s in short_sorted if s.best_bid is not None]
+        long_executable = [l for l in long_sorted if l.best_ask is not None]
+        if not short_executable or not long_executable:
+            return None, None
+
+        long_timestamps = [l.ts for l in long_executable]
         tolerance = timedelta(seconds=_ENTRY_MATCH_TOLERANCE_SEC)
-        for s in short_sorted:
-            if s.best_bid is None:
-                continue
-            for l in long_sorted:
-                if l.best_ask is None:
-                    continue
-                if abs((l.ts - s.ts).total_seconds()) <= tolerance.total_seconds():
-                    return s, l
+
+        for s in short_executable:
+            window_start = s.ts - tolerance
+            window_end = s.ts + tolerance
+            lo = bisect_left(long_timestamps, window_start)
+            hi = bisect_right(long_timestamps, window_end)
+            if lo < hi:
+                # Any tick in [lo, hi) is within tolerance of s by
+                # construction of the bisect window -- take the first
+                # (earliest) one, matching the original loop's behavior of
+                # returning the first match encountered when scanning
+                # long_sorted in order.
+                return s, long_executable[lo]
+
         return None, None
 
     @staticmethod
