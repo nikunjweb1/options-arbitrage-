@@ -160,6 +160,7 @@ def _load_ticks(conn: sqlite3.Connection, exchange: str, instrument_id: str) -> 
 
 
 def _data_window(conn: sqlite3.Connection) -> tuple[datetime | None, datetime | None]:
+    conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT MIN(ts) AS min_ts, MAX(ts) AS max_ts FROM market_data").fetchone()
     if row is None or row["min_ts"] is None:
         return None, None
