@@ -549,3 +549,110 @@ class TestPremiumScalingUnitConsistency:
             f"per-contract scale (~tens) -- Bug #2 may have reappeared."
         )
         assert result.worst_case_pnl <= result.expected_value <= result.best_case_pnl
+
+
+class TestCrossLegIVDivergence:
+    """
+    Regression tests for Bug #3 (2026-08-23): long-leg repricing used the
+    SHORT leg's IV instead of its own. This directly undermines the
+    strategy's actual economic basis, per the project owner's own
+    description: "compare their premium and implied volatility (IV)...
+    if one option is relatively overpriced, sell that option and buy the
+    relatively cheaper later-expiry option." If the long leg's own quoted
+    IV is silently replaced with the short leg's, the model can never
+    detect -- let alone price -- the exact cross-leg IV divergence this
+    strategy trades on. See pricing/ev_engine.py's "BUG #3" docstring note.
+    """
+
+    def test_long_leg_uses_its_own_quoted_iv_not_the_short_legs(self) -> None:
+        """
+        Direct check on the EVResult's own short/long IV fields -- the most
+        literal possible regression guard: if someone reverts the fix,
+        long_iv_used would equal base_iv_used (the short leg's IV) again,
+        even when the two snapshots quote genuinely different IVs.
+        """
+        short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
+        long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
+        candidate = _make_candidate(short, long_)
+
+        # Short leg richly priced at 80% IV, long leg genuinely cheap at 40% IV
+        # -- exactly the "one option relatively overpriced" scenario described.
+        short_snap = _make_snapshot(instrument_id="1", best_bid=Decimal("1628"), best_ask=Decimal("1640"), iv=Decimal("0.80"))
+        long_snap = _make_snapshot(instrument_id="2", best_bid=Decimal("1420"), best_ask=Decimal("1436"), iv=Decimal("0.40"))
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert result.base_iv_used == 0.80, "short leg's own IV must still drive the price-move grid"
+        assert result.long_iv_used == 0.40, (
+            f"long_iv_used={result.long_iv_used} should be the long leg's OWN quoted "
+            f"IV (0.40), not the short leg's (0.80) -- Bug #3 may have reappeared."
+        )
+
+    def test_divergent_iv_produces_different_ev_than_shared_iv_would(self) -> None:
+        """
+        Correctness, not just field plumbing: repricing with the long leg's
+        own (lower) IV must produce a materially different EV than the old
+        (buggy) behavior of reusing the short leg's (higher) IV would have.
+        Verified independently: black_scholes_price at 40% IV vs 80% IV for
+        this contract differs by ~$1435 on a ~$1436 true value -- roughly
+        2x -- so this is not a rounding-level assertion.
+        """
+        short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
+        long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
+        candidate = _make_candidate(short, long_)
+
+        short_snap_high_iv = _make_snapshot(instrument_id="1", best_bid=Decimal("1628"), best_ask=Decimal("1640"), iv=Decimal("0.80"))
+        long_snap_cheap_iv = _make_snapshot(instrument_id="2", best_bid=Decimal("1420"), best_ask=Decimal("1436"), iv=Decimal("0.40"))
+        long_snap_matching_iv = _make_snapshot(instrument_id="2", best_bid=Decimal("1420"), best_ask=Decimal("1436"), iv=Decimal("0.80"))
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result_cheap_long_iv = engine.evaluate(candidate, short_snap_high_iv, long_snap_cheap_iv)
+        result_matching_iv = engine.evaluate(candidate, short_snap_high_iv, long_snap_matching_iv)
+
+        # Same entry premiums in both cases (net_entry_cost identical) -- only
+        # the long leg's IV differs, so any EV difference is purely from
+        # correctly using the long leg's own IV in repricing.
+        assert result_cheap_long_iv.net_entry_cost == result_matching_iv.net_entry_cost
+        assert result_cheap_long_iv.expected_value != result_matching_iv.expected_value, (
+            "EV must differ when the long leg's own quoted IV genuinely differs from "
+            "the short leg's -- if these are equal, the long leg's IV isn't actually "
+            "being used, and Bug #3 has reappeared."
+        )
+
+    def test_equal_iv_fixtures_are_unaffected_backward_compatibility(self) -> None:
+        """
+        Every OTHER test in this file uses equal short/long IVs by
+        construction -- confirms this fix is exactly backward compatible
+        with those cases (long_iv_used falls back to equal short_base_iv
+        when both snapshots agree, producing identical numbers to before
+        this fix)."""
+        short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
+        long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
+        candidate = _make_candidate(short, long_)
+
+        short_snap = _make_snapshot(instrument_id="1", best_bid=Decimal("300"), best_ask=Decimal("310"), iv=Decimal("0.65"))
+        long_snap = _make_snapshot(instrument_id="2", best_bid=Decimal("500"), best_ask=Decimal("520"), iv=Decimal("0.65"))
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert result.base_iv_used == result.long_iv_used == 0.65
+
+    def test_missing_long_iv_falls_back_to_short_legs_iv(self) -> None:
+        """When the long snapshot genuinely has no IV, falling back to the
+        short leg's IV is a reasonable last resort -- strictly better than
+        the old unconditional behavior, but still a documented fallback,
+        not the primary path."""
+        short = _make_contract(instrument_id="1", expiry_timestamp=_T1, settlement_timestamp=_T1)
+        long_ = _make_contract(instrument_id="2", strike=Decimal("65000"), expiry_timestamp=_T2, settlement_timestamp=_T2)
+        candidate = _make_candidate(short, long_)
+
+        short_snap = _make_snapshot(instrument_id="1", iv=Decimal("0.55"))
+        long_snap = _make_snapshot(instrument_id="2", iv=None)
+
+        engine = LeanEVEngine(short_taker_fee_pct=Decimal("0.0005"), long_taker_fee_pct=Decimal("0.0005"))
+        result = engine.evaluate(candidate, short_snap, long_snap)
+
+        assert result.base_iv_used == 0.55
+        assert result.long_iv_used == 0.55  # fell back to short's IV, not the 0.80 default
