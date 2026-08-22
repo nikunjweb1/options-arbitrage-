@@ -46,6 +46,24 @@ especially for same_exchange_calendar_spread candidates with short-dated
 D1 short legs -- the gap between match time and price time is itself a
 source of data loss, not just a cosmetic delay.
 
+DIAGNOSTIC FIELDS ADDED (2026-08-22): after the contract_multiplier fix,
+the second live run (699 usable candidates) still showed a hard, exact
+100%/0% split on probability_of_profit for every printed result -- nothing
+in between. That's not necessarily wrong (see ev_engine.py's own note on
+why (v_long - short_payoff) is structurally >= 0 for exact-strike calendar
+spreads), but it's also consistent with a different, more mundane gap: for
+candidates whose short leg expires within hours (not days), sigma_move
+(the fractional 1-standard-deviation price move the scenario grid explores)
+can be tiny -- e.g. ~1.2% for a 3-hour-to-expiry leg at 65% IV -- so even
+the +/-2 sigma grid points barely move the price, and the grid can't
+discover a losing scenario even where one might exist at a coarser but more
+realistic move size. EVResult now carries time_to_short_expiry_hours,
+sigma_move, and base_iv_used so this printout can show, for each ranked
+result, whether "guaranteed profit" is backed by a real price range or by
+an accidentally too-narrow one. This is a visibility fix, not a pricing
+fix -- it doesn't change any EV/probability number, it just surfaces the
+inputs that produced it.
+
 Usage:
     python -m pricing.run_pricing --underlying BTC
     python -m pricing.run_pricing --underlying BTC --min-confidence 0.8 --limit 50
@@ -267,6 +285,9 @@ def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
             "net_entry_cost": str(r.net_entry_cost),
             "short_bid_used": str(r.short_bid_used),
             "long_ask_used": str(r.long_ask_used),
+            "time_to_short_expiry_hours": r.time_to_short_expiry_hours,
+            "sigma_move": r.sigma_move,
+            "base_iv_used": r.base_iv_used,
             "model_notes": list(r.model_notes),
         }
         rows.append((
@@ -287,6 +308,21 @@ def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
     conn.commit()
 
 
+def _log_result_line(r: EVResult) -> None:
+    """
+    One ranked-result log line, including the diagnostic fields
+    (time_to_short_expiry_hours, sigma_move, base_iv_used) added 2026-08-22
+    so a P(profit) of exactly 1.0 or 0.0 can be explained rather than just
+    reported. See module docstring's DIAGNOSTIC FIELDS ADDED note.
+    """
+    logger.info(
+        "  EV=%s  P(profit)=%s  net_entry=%s  fees=%s  "
+        "hrs_to_short_expiry=%.2f  sigma_move=%.4f  iv_used=%.4f  %s",
+        r.expected_value, r.probability_of_profit, r.net_entry_cost, r.fees_total,
+        r.time_to_short_expiry_hours, r.sigma_move, r.base_iv_used, r.pair_id,
+    )
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -300,8 +336,15 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None,
                          help="Price at most N candidates -- useful for a smoke test before a full 1,504-pair run.")
     parser.add_argument("--top", type=int, default=20, help="How many top-EV results to print.")
+    parser.add_argument("--bottom", type=int, default=None,
+                         help="How many lowest-EV results to also print, with the same diagnostic fields as "
+                              "--top. Defaults to the same value as --top. Printed separately from --top so "
+                              "both tails of the distribution are always visible, even in datasets (like the "
+                              "699-candidate run on 2026-08-22) where the number of positive-EV results is "
+                              "smaller than --top and the negative tail would otherwise get crowded out.")
     parser.add_argument("--dry-run", action="store_true", help="Print results without writing to `signals`.")
     args = parser.parse_args()
+    bottom_n = args.bottom if args.bottom is not None else args.top
 
     if not DB.sqlite_path.exists():
         logger.error("No database found at %s. Run db/init_db.py and the collectors/matcher first.", DB.sqlite_path)
@@ -395,10 +438,32 @@ def main() -> int:
     )
 
     ranked = sorted(results, key=lambda r: r.expected_value, reverse=True)
+
+    logger.info("Top %d by EV (each line: EV, P(profit), net entry, fees, hours-to-short-expiry, "
+                "sigma_move, IV used, pair id) --", min(args.top, len(ranked)))
     for r in ranked[: args.top]:
+        _log_result_line(r)
+
+    if bottom_n:
+        bottom_slice = ranked[-bottom_n:] if bottom_n < len(ranked) else ranked
+        # Print ascending (worst first) so the most negative EV leads --
+        # mirrors how the top section leads with the highest EV.
+        logger.info("Bottom %d by EV, for comparison --", min(bottom_n, len(ranked)))
+        for r in sorted(bottom_slice, key=lambda r: r.expected_value):
+            _log_result_line(r)
+
+    # Quick aggregate check on the P(profit) split itself: how many results
+    # land at exactly 1.0 or exactly 0.0 vs. somewhere in between. A large
+    # share at the exact extremes, concentrated among short hours-to-expiry
+    # candidates, points at the sigma_move resolution gap described in the
+    # module docstring rather than a real all-or-nothing market signal.
+    exact_one = sum(1 for r in results if r.probability_of_profit == Decimal("1"))
+    exact_zero = sum(1 for r in results if r.probability_of_profit == Decimal("0"))
+    if results:
         logger.info(
-            "  EV=%s  P(profit)=%s  net_entry=%s  fees=%s  %s",
-            r.expected_value, r.probability_of_profit, r.net_entry_cost, r.fees_total, r.pair_id,
+            "P(profit) split: %d/%d exactly 1.0, %d/%d exactly 0.0, %d/%d strictly between 0 and 1.",
+            exact_one, len(results), exact_zero, len(results),
+            len(results) - exact_one - exact_zero, len(results),
         )
 
     if args.dry_run:

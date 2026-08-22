@@ -109,6 +109,22 @@ class EVResult:
     short_bid_used: Decimal
     long_ask_used: Decimal
     fees_total: Decimal
+    # --- Diagnostic fields (added 2026-08-22) -------------------------------
+    # Not used in the P&L math itself -- these exist so a caller (e.g.
+    # run_pricing.py's ranked printout) can tell WHY a result landed at
+    # P(profit)=1.0 or 0.0 exactly, instead of guessing. A hard 100%/0% split
+    # with nothing in between across many candidates is a signal worth
+    # checking, not necessarily a bug -- these fields make that checkable.
+    time_to_short_expiry_hours: float = 0.0
+    # sigma_move is the fractional 1-standard-deviation price move the price
+    # grid explored over time_to_short_expiry_hours (base_iv * sqrt(T)). If
+    # this is tiny (near-zero time-to-expiry), the +/-2 sigma grid barely
+    # moves the price at all, so the scenario grid degenerates toward a
+    # single point and can't discover a losing (or winning) scenario even if
+    # one exists -- that's a modeling-resolution gap, not evidence the trade
+    # itself is risk-free or hopeless.
+    sigma_move: float = 0.0
+    base_iv_used: float = 0.0
     model_notes: tuple[str, ...] = field(default_factory=lambda: (
         "Lean scenario grid (Section L.2), not a full Monte Carlo or "
         "historical-IV-fitted model -- see pricing/ev_engine.py module "
@@ -269,4 +285,7 @@ class LeanEVEngine:
             short_bid_used=short_bid,
             long_ask_used=long_ask,
             fees_total=fees_total,
+            time_to_short_expiry_hours=time_to_T1_years * 365 * 24,
+            sigma_move=sigma_move,
+            base_iv_used=base_iv,
         )
