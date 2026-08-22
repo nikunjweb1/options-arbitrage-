@@ -15,13 +15,23 @@ MatchCandidate plus the historical ticks already read for both legs and
 returns a BacktestTradeResult. backtest/run_backtest.py is the CLI that
 reads real `market_data` rows and drives this.
 
-Reuses the same contract_multiplier fix from pricing/ev_engine.py (see that
-module's "BUG FOUND + FIXED" docstring note): settlement_payoff() operates in
-raw per-1-unit-of-underlying terms and must be scaled by contract_multiplier
-before being combined with real exchange-quoted premiums (best_bid/best_ask),
-which are already contract-scaled. Getting this wrong here would reproduce
-the exact same unit-mismatch bug in the backtester that was found and fixed
-in the pricing engine.
+BUG FOUND + FIXED (2026-08-23): the first real backtest run against 4,574
+candidates produced avg_pnl_per_trade=$2848.87 and total_realized_pnl=$1.58M
+at a 59% win rate -- implausible for 0.001-BTC-multiplier contracts, where
+real per-trade P&L should be single-to-low-double-digit dollars. Root cause:
+this module's docstring previously claimed to have "reused the
+contract_multiplier fix from pricing/ev_engine.py," but only actually
+applied it to settlement_payoff -- it never applied it to
+entry_short.best_bid / entry_long.best_ask (net_entry_cost), the
+legging-failure loss calculation, or the long leg's exit price. Those raw
+ticks, per the diagnose_pair.py finding documented in ev_engine.py's own
+"BUG #2" note, are quoted in raw per-1-BTC terms (same scale as spot/strike),
+not per-contract -- so net_entry_cost and long_exit_price were running
+roughly 1/contract_multiplier too large, the exact same bug class as Bug #2
+in the EV engine, just never ported over here. Fixed by scaling every
+premium (entry bid/ask, exit bid, legging-failure loss basis, settlement-fee
+cap basis) by its own leg's contract_multiplier, consistently with
+short_payoff. See tests/test_backtest_engine.py::TestPremiumScalingUnitConsistency.
 """
 
 from __future__ import annotations
@@ -78,8 +88,6 @@ def _deterministic_unit_interval(pair_id: str) -> Decimal:
     outcome every run.
     """
     digest = hashlib.sha256(pair_id.encode("utf-8")).hexdigest()
-    # First 13 hex digits give ~52 bits, comfortably more precision than a
-    # Decimal-based P&L calc needs for a uniform-in-[0,1) draw.
     as_int = int(digest[:13], 16)
     max_int = 16**13
     return Decimal(as_int) / Decimal(max_int)
@@ -143,10 +151,18 @@ class LeanBacktester:
                        "assumed to have entered at some other price.",),
             )
 
+        # BUG FIX (2026-08-23): scale raw quoted premiums by each leg's OWN
+        # contract_multiplier -- see module docstring. Applied once here so
+        # every downstream use (legging-failure loss, entry economics) is
+        # consistent, rather than scaling in multiple places and risking one
+        # getting missed again.
+        entry_short_bid_scaled = entry_short.best_bid * short.contract_multiplier
+        entry_long_ask_scaled = entry_long.best_ask * long_.contract_multiplier
+
         # -- Legging-failure simulation (Section G.1 item 4) --------------------
         draw = _deterministic_unit_interval(candidate.pair_id)
         if draw < self._legging_failure_rate:
-            gross_entry_credit = entry_short.best_bid - entry_long.best_ask
+            gross_entry_credit = entry_short_bid_scaled - entry_long_ask_scaled
             assumed_loss = abs(gross_entry_credit) * self._legging_failure_cost_pct
             return BacktestTradeResult(
                 pair_id=candidate.pair_id,
@@ -160,8 +176,8 @@ class LeanBacktester:
             )
 
         # -- Entry economics (same formula as pricing/ev_engine.py Section D.2) --
-        short_bid = entry_short.best_bid
-        long_ask = entry_long.best_ask
+        short_bid = entry_short_bid_scaled
+        long_ask = entry_long_ask_scaled
         gross_entry_credit = short_bid - long_ask
         short_entry_fee = short_bid * self._short_fee_pct
         long_entry_fee = long_ask * self._long_fee_pct
@@ -185,14 +201,13 @@ class LeanBacktester:
         short_payoff = short_payoff_raw * short.contract_multiplier
 
         # Section G.1 item 3, non-negotiable: zero settlement fee if OTM.
-        # This is a gap in pricing/ev_engine.py (which doesn't model a
-        # settlement fee at all) that the backtester corrects for, since
-        # this non-negotiable applies specifically to backtesting.
         if short_payoff_raw == 0 and self._zero_fee_on_otm_settlement:
             settlement_fee = Decimal("0")
         else:
             settlement_fee = settlement_index_price * self._settlement_fee_pct * short.contract_multiplier
             if self._fee_cap_pct_of_premium is not None:
+                # BUG FIX: cap basis must be the scaled (per-contract) short
+                # premium, matching everything else in this method now.
                 cap = abs(short_bid) * self._fee_cap_pct_of_premium
                 settlement_fee = min(settlement_fee, cap)
 
@@ -213,7 +228,8 @@ class LeanBacktester:
                        "substituted.",),
             )
 
-        long_exit_price = exit_tick.best_bid
+        # BUG FIX: scale the exit price by the long leg's contract_multiplier too.
+        long_exit_price = exit_tick.best_bid * long_.contract_multiplier
         long_exit_fee = long_exit_price * self._long_fee_pct
 
         realized_pnl = net_entry_cost - short_payoff - settlement_fee + long_exit_price - long_exit_fee
@@ -240,30 +256,10 @@ class LeanBacktester:
         """
         Earliest short-leg tick with an executable best_bid that has a
         matching long-leg tick (executable best_ask) within
-        _ENTRY_MATCH_TOLERANCE_SEC. This is the single, simplest entry rule
-        the lean plan calls for (Section G.2: "one entry threshold") -- not
-        a sweep over multiple candidate entry times.
+        _ENTRY_MATCH_TOLERANCE_SEC.
 
-        PERFORMANCE FIX (2026-08-22): originally a naive nested loop over
-        every (short_tick, long_tick) pair -- O(n*m). For candidates whose
-        legs have thousands of collected ticks (long-lived contracts with
-        continuous WebSocket capture per collectors/realtime_collector.py),
-        and especially for candidates where NO match exists at all (worst
-        case: the full n*m product gets scanned before giving up), this made
-        individual candidates take seconds each, and the whole backtest run
-        slow to a crawl partway through -- exactly the symptom reported
-        running `python -m backtest.run_backtest --underlying BTC`.
-
-        Since both short_sorted and long_sorted are already sorted by
-        timestamp (guaranteed by the caller, simulate_pair), this is now a
-        binary search per short tick: for each short tick's tolerance
-        window, bisect into the long-leg timestamp list to find the window
-        boundaries in O(log m), instead of scanning every long tick. Overall
-        complexity: O(n log m) instead of O(n*m) -- the same result (first
-        short tick, by time, with any executable long tick inside its
-        tolerance window), just found without the redundant scanning. See
-        tests/test_backtest_engine.py::TestFindEntryPerformance for the
-        regression test that verifies this stays fast on large inputs.
+        O(n log m) via bisect (both lists pre-sorted by the caller) --
+        see tests/test_backtest_engine.py::TestFindEntryPerformance.
         """
         short_executable = [s for s in short_sorted if s.best_bid is not None]
         long_executable = [l for l in long_sorted if l.best_ask is not None]
@@ -279,11 +275,6 @@ class LeanBacktester:
             lo = bisect_left(long_timestamps, window_start)
             hi = bisect_right(long_timestamps, window_end)
             if lo < hi:
-                # Any tick in [lo, hi) is within tolerance of s by
-                # construction of the bisect window -- take the first
-                # (earliest) one, matching the original loop's behavior of
-                # returning the first match encountered when scanning
-                # long_sorted in order.
                 return s, long_executable[lo]
 
         return None, None
