@@ -60,6 +60,29 @@ every dollar figure in the P&L formula is consistently in "per one real
 exchange contract" terms. See
 tests/test_ev_engine.py::TestPremiumScalingUnitConsistency for the
 regression test built directly from the real diagnose_pair.py output above.
+
+BUG #3 FOUND + FIXED (2026-08-23): `base_iv` was read ONLY from
+short_snapshot.iv, and that single value was then reused to reprice the
+LONG leg's Black-Scholes value at T1 -- long_snapshot.iv was never read
+anywhere in this file. This directly undermines the strategy's actual
+economic basis (per the project owner's own description of the trade):
+"compare their premium and implied volatility (IV)... if one option is
+relatively overpriced, sell that option and buy the relatively cheaper
+later-expiry option." If the long leg's own quoted IV is silently replaced
+with the short leg's, the model can never detect -- let alone correctly
+price -- exactly the cross-leg IV divergence this strategy is supposed to
+be trading on. Quantified via a realistic example (short IV=80%, long
+IV=40%, 7d option, spot=strike=65000): repricing the long leg with the
+short leg's IV instead of its own overstates its fair value by ~$1435 on a
+~$1436 true value -- roughly 2x, not a rounding error.
+
+FIX: long-leg repricing now uses long_snapshot.iv as its own base IV
+(falling back to the short leg's IV only if the long snapshot has none,
+which is strictly better than the previous unconditional reuse). The
+underlying price-move grid (sigma_move) still uses the short leg's IV,
+since that governs the near-term move up to the short leg's own expiry --
+a different, still-correct use of short IV, not affected by this fix.
+See tests/test_ev_engine.py::TestCrossLegIVDivergence.
 """
 
 from __future__ import annotations
@@ -115,13 +138,17 @@ class EVResult:
     fees_total: Decimal = Decimal("0")
     time_to_short_expiry_hours: float = 0.0
     sigma_move: float = 0.0
-    base_iv_used: float = 0.0
+    base_iv_used: float = 0.0  # short leg's own quoted IV -- drives the underlying price-move grid (sigma_move)
+    long_iv_used: float = 0.0  # long leg's own quoted IV -- drives long-leg repricing (Bug #3 fix, see module docstring)
     model_notes: tuple[str, ...] = field(default_factory=lambda: (
         "Lean scenario grid (Section L.2, 21-point price grid x 3-point IV "
         "shock). ALL dollar figures (premiums, payoffs, repricing) are "
         "scaled by each leg's own contract_multiplier to real per-contract "
-        "terms -- see pricing/ev_engine.py module docstring, Bug #2, for "
-        "why this needed fixing on the premium side specifically.",
+        "terms -- see pricing/ev_engine.py module docstring, Bug #2. "
+        "Long-leg repricing uses the LONG leg's own quoted IV, not the "
+        "short leg's -- see Bug #3 -- so genuine cross-leg IV divergence "
+        "(the actual economic basis of this strategy) is priced in rather "
+        "than silently assumed away.",
     ))
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -196,7 +223,15 @@ class LeanEVEngine:
             (long_.expiry_timestamp - short.expiry_timestamp).total_seconds() / (365 * 24 * 3600), 0.0
         )
 
-        base_iv = float(short_snapshot.iv) if short_snapshot.iv is not None and short_snapshot.iv > 0 else 0.80
+        # BUG #3 FIX: short and long legs now each use THEIR OWN quoted IV,
+        # not one value silently reused for both. short_base_iv drives the
+        # underlying price-move grid (sigma_move, below); long_base_iv drives
+        # the long leg's own Black-Scholes repricing. Falling back to the
+        # short leg's IV only when the long snapshot genuinely has none is
+        # strictly better than the previous unconditional reuse -- it's a
+        # last-resort fallback, not the primary source.
+        short_base_iv = float(short_snapshot.iv) if short_snapshot.iv is not None and short_snapshot.iv > 0 else 0.80
+        long_base_iv = float(long_snapshot.iv) if long_snapshot.iv is not None and long_snapshot.iv > 0 else short_base_iv
 
         spot_now = short_snapshot.underlying_spot or short_snapshot.underlying_index
         if spot_now is None:
@@ -205,7 +240,7 @@ class LeanEVEngine:
                 f"short leg's snapshot -- cannot build the price scenario grid."
             )
 
-        sigma_move = base_iv * math.sqrt(time_to_T1_years) if time_to_T1_years > 0 else 0.0
+        sigma_move = short_base_iv * math.sqrt(time_to_T1_years) if time_to_T1_years > 0 else 0.0
         price_weights = _grid_weights(_PRICE_GRID_Z)
 
         short_kind = OptionKind.CALL if short.option_type == OptionType.CALL else OptionKind.PUT
@@ -221,7 +256,9 @@ class LeanEVEngine:
             short_payoff = short_payoff_raw * short.contract_multiplier
 
             for iv_shock, iv_weight in zip(_IV_SHOCK_GRID, [1 / len(_IV_SHOCK_GRID)] * len(_IV_SHOCK_GRID)):
-                sigma_at_t1 = max(base_iv * (1 + iv_shock), 0.01)
+                # BUG #3 FIX: was base_iv (short leg's IV, wrong for this
+                # purpose) -- now long_base_iv, the long leg's OWN quoted IV.
+                sigma_at_t1 = max(long_base_iv * (1 + iv_shock), 0.01)
                 v_long_raw = black_scholes_price(
                     spot=s_t1,
                     strike=long_.strike,
@@ -259,5 +296,6 @@ class LeanEVEngine:
             fees_total=fees_total,
             time_to_short_expiry_hours=time_to_T1_years * 365 * 24,
             sigma_move=sigma_move,
-            base_iv_used=base_iv,
+            base_iv_used=short_base_iv,
+            long_iv_used=long_base_iv,
         )
