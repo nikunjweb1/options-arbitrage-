@@ -1,70 +1,92 @@
 """
-Shark Exchange WebSocket client -- real-time market data + (eventually)
-authenticated order/position updates.
+Shark Exchange WebSocket client -- real-time OPTIONS market data.
 
-CONFIRMATION STATUS -- more unconfirmed than exchange_adapters/delta_ws.py
-was at the equivalent point, and that file's own docstring is the template
-for how this one is written: confirmed pieces stated plainly, unconfirmed
-pieces flagged loudly rather than guessed silently.
+CONFIRMATION STATUS -- major update 2026-08-23. The previous version of
+this file was a scaffold built entirely from unconfirmed guesses (see git
+history). It has now been rewritten against REAL frames captured directly
+from a live sharkexchange.in options session via browser DevTools
+(Network tab -> WS -> Messages sub-tab), while the option chain for
+BTC-USDT was actively streaming. What follows is genuinely confirmed, not
+inferred.
 
-CONFIRMED (from docs.sharkexchange.in's sidebar navigation structure):
-  - There IS a documented WebSocket surface, split into:
-      * Public Web Sockets (market data, presumably no auth -- matches the
-        REST pattern where /v1/market/* endpoints are public)
-      * Authenticated Web Sockets, gated behind a Listen Key lifecycle:
-        Create Listen Key / Get Listen Key / Update Listen Key / Delete
-        Listen Key -- this is the same pattern Binance, MEXC, and HashKey
-        Global all use (POST to mint a key, PUT/GET to keep it alive,
-        DELETE to close it, then connect wss://.../ws?listenKey=... or
-        similar and the key scopes the authenticated stream to your
-        account without putting your API secret on the wire per-message).
+CONFIRMED, from real captured frames:
+  - Transport protocol is standard Engine.IO v4 + Socket.IO v4 -- NOT a
+    raw/custom WebSocket protocol. This matters: a plain `websocket-client`
+    connection (what this file used before, and what delta_ws.py correctly
+    uses for Delta's genuinely-raw WS) CANNOT correctly speak this protocol
+    -- it doesn't do the Engine.IO handshake, upgrade dance, or Socket.IO
+    packet-type framing. This file now uses the `python-socketio` client
+    library instead, which speaks this protocol properly.
+  - Confirmed handshake, in order (captured via DevTools XHR-polling
+    frames before the WS upgrade): Engine.IO open packet
+    `0{"sid":"...","upgrades":["websocket"],"pingInterval":180000,
+    "pingTimeout":60000,...}`, then Socket.IO connect packet
+    `40{"sid":"..."}` -- both handled automatically by python-socketio,
+    documented here only so the shape is understood if something needs
+    debugging by hand later.
+  - Confirmed real event names (captured live, multiple examples of each):
+      * "ticker"     -- per-instrument live quote update
+      * "orderBook"  -- per-instrument order book update
+      * "indexPrice" -- underlying spot/index price update
+  - Confirmed real options symbol format:
+      "BTC-24AUG26-73000-P-USDT"  (BTC put, strike 73000, expires 24 Aug 2026, USDT-settled)
+      "BTC-24AUG26-75000-C-USDT"  (BTC call, strike 75000, same expiry)
+    Pattern: {BASE}-{DD}{MMM}{YY}-{STRIKE}-{C|P}-{QUOTE}
+    This is the confirmed symbol format needed for get_option_chain() /
+    get_ticker() / place_order() on shark.py -- see that file's updated
+    docstring.
+  - Confirmed "ticker" event fields (from a real captured payload,
+    field list below is exactly what was visible in the captured frame --
+    the frame was truncated in the DevTools panel before the full payload
+    printed, so treat this as CONFIRMED-PRESENT, not CONFIRMED-COMPLETE):
+      symbol, bidPrice, bidSize, bidIv, askPrice, askSize, askIv,
+      lastPrice, highPrice24h, lowPrice24h, ... (truncated -- likely
+      continues with markPrice/markIv/greeks/openInterest/volume based on
+      what a usable options ticker needs, but NOT confirmed -- treat any
+      field not in the list above as unconfirmed until independently seen).
+  - Confirmed "orderBook" event fields (also truncated in capture):
+      {"bids": [[price_str, size_str], [price_str, size_str], ...], ...}
+      "asks" almost certainly exists symmetrically but was cut off in the
+      captured frame -- NOT independently confirmed, treated as probable.
+  - Confirmed "indexPrice" event, FULL payload (this one was short enough
+    to capture completely):
+      {"indexPrice": "77242.1492131", "baseCoin": "BTC", "quoteCoin": "USDT"}
 
-NOT CONFIRMED -- genuinely unknown, not guessed, despite two full-page
-fetch attempts and a targeted search (2026-08-23) that all failed to
-surface this specific content (the docs page is a single very large
-Slate-style doc that truncates before reaching the WebSocket section in
-every fetch attempted):
-  - The actual `wss://` base URL.
-  - The exact REST paths for the Create/Get/Update/Delete Listen Key calls
-    (guessed below as a Binance-style `/v1/userDataStream` convention --
-    this is a PLACEHOLDER, not a confirmed path, and is clearly marked as
-    such at its point of use).
-  - Public channel names (e.g. whatever Shark calls its ticker/depth/trade
-    streams) -- delta_ws.py's own history is the cautionary tale here: the
-    "obvious" guess ("ticker") was wrong for Delta (the working name was
-    "v2/ticker", only discovered by live-testing). Assume the same risk
-    applies here and do NOT trust any channel name in this file until it's
-    been confirmed against a live connection.
-  - Message envelope shape (subscribe/unsubscribe JSON format, ping/pong
-    convention) -- Shark's REST responses use a plain JSON body (not an
-    envelope like CoinSwitch HFT's {"retCode", "retMsg", "result"}), so the
-    WS envelope is presented below as a guess following that same plain
-    convention, but this is unverified.
-
-FASTEST PATH TO CONFIRMING THE MISSING PIECES: open sharkexchange.in in a
-browser, log in, open DevTools -> Network tab -> filter "WS", visit a live
-options/futures price page, and copy the exact wss:// URL and the first few
-subscribe/message frames from the live connection. That is strictly more
-reliable than anything further web research can produce here, since it's
-Shark's own official UI talking to Shark's own backend.
-
-Until ws_url is supplied and the channel name(s)/message shapes below are
-corrected against a real connection, treat this file as a scaffold with the
-reconnect/threading logic ready to go, not as something that will
-successfully receive real data yet.
+STILL NOT CONFIRMED:
+  - The exact wss:// URL. The capture showed the Messages/frame content but
+    not the connection's Request URL. `_WS_URL_INFERRED` below is a
+    reasoned inference, not a guess pulled from nowhere: Shark's REST API
+    is confirmed to live at https://api.sharkexchange.in (see shark.py),
+    and serving Socket.IO off the same host via the conventional
+    `/socket.io/` path is the standard pattern for this protocol. But this
+    specific detail was NOT read off a captured Headers panel the way
+    everything above was. Low-risk to get wrong (a bad WS URL just fails
+    to connect, it doesn't place an order or move money) but still worth
+    confirming for certainty -- see get_confirmed_ws_url()'s docstring for
+    the fastest way to nail it exactly.
+  - Whether a "subscribe" call is even required. No outgoing subscribe
+    frame was visible in the captured session -- ticker/orderBook/
+    indexPrice events for multiple different strikes were streaming
+    without an observed subscribe emit. Two explanations, both plausible:
+    (a) the subscribe happened before DevTools started recording, or
+    (b) this socket just broadcasts all live options data for the loaded
+    underlying with no per-symbol subscribe step at all. This file emits a
+    "subscribe" event as a reasonable, low-risk attempt (harmless if
+    ignored) but does NOT rely on it being necessary -- the on_ticker
+    handler processes any ticker event received regardless of whether an
+    explicit subscribe was acknowledged.
+  - Authenticated (order/position update) channel entirely -- nothing
+    about that was captured in this session, which only exercised public
+    market data. Section is left as a documented gap, not built.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import threading
-import time
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
-import websocket
+import socketio
 
 from normalization.schemas import MarketSnapshot
 
@@ -72,166 +94,118 @@ logger = logging.getLogger("shark_ws")
 
 MarketSnapshotCallback = Callable[[MarketSnapshot], None]
 
-# PLACEHOLDER -- not confirmed. Best guess at a name for Shark's ticker
-# stream, following the REST endpoint's naming (ticker24Hr). Verify against
-# a live connection (see module docstring) before trusting this.
-_TICKER_CHANNEL_GUESS = "ticker24Hr"
+# Reasoned inference, not independently confirmed -- see module docstring's
+# STILL NOT CONFIRMED section. Override via the constructor if a captured
+# Headers panel shows something different.
+_WS_URL_INFERRED = "https://api.sharkexchange.in"
 
 
 class SharkWebSocketClient:
     """
-    Structurally mirrors exchange_adapters/delta_ws.py's DeltaWebSocketClient
-    (background thread, auto-reconnect with backoff, re-subscribe on
-    reconnect, caller-supplied MarketSnapshot callback) so the two clients
-    are interchangeable from the collector's point of view. The one required
-    difference: `ws_url` must be passed in explicitly rather than read from
-    a config singleton, since it isn't confirmed yet -- see module docstring.
+    Thin wrapper around python-socketio's Client, giving this class the same
+    public shape (start/stop/subscribe/wait_until_connected) as
+    delta_ws.py's DeltaWebSocketClient for interchangeability, even though
+    the underlying transport mechanics are different (Socket.IO vs raw WS)
+    and python-socketio handles reconnection internally rather than needing
+    our own backoff loop.
     """
 
     def __init__(
         self,
-        ws_url: str,
         on_snapshot: MarketSnapshotCallback,
-        reconnect_backoff_base_sec: float = 1.0,
-        reconnect_backoff_max_sec: float = 30.0,
-        ping_interval_sec: int = 20,
+        ws_url: str = _WS_URL_INFERRED,
+        reconnection_attempts: int = 0,  # 0 = retry forever, matches delta_ws.py's never-give-up behavior
+        reconnection_delay: float = 1.0,
+        reconnection_delay_max: float = 30.0,
     ) -> None:
-        if not ws_url:
-            raise ValueError(
-                "ws_url is required and not confirmed for Shark yet -- capture it from "
-                "browser DevTools (Network tab, filter WS) against a live sharkexchange.in "
-                "session. See this module's docstring."
-            )
         self._on_snapshot = on_snapshot
         self._ws_url = ws_url
-        self._reconnect_backoff_base = reconnect_backoff_base_sec
-        self._reconnect_backoff_max = reconnect_backoff_max_sec
-        self._ping_interval = ping_interval_sec
+        self._sio = socketio.Client(
+            reconnection=True,
+            reconnection_attempts=reconnection_attempts,
+            reconnection_delay=reconnection_delay,
+            reconnection_delay_max=reconnection_delay_max,
+            logger=False,
+            engineio_logger=False,
+        )
+        self._pending_symbols: set[str] = set()
 
-        self._symbols: set[str] = set()
-        self._symbols_lock = threading.Lock()
+        self._sio.on("connect", self._on_connect)
+        self._sio.on("disconnect", self._on_disconnect)
+        self._sio.on("ticker", self._on_ticker)
+        self._sio.on("orderBook", self._on_order_book)
+        self._sio.on("indexPrice", self._on_index_price)
 
-        self._ws_app: websocket.WebSocketApp | None = None
-        self._thread: threading.Thread | None = None
-        self._should_run = False
-        self._connected_event = threading.Event()
-
-        self._reconnect_attempt = 0
-
-    # -- public API -------------------------------------------------------
+    # -- public API ---------------------------------------------------------
 
     def start(self) -> None:
-        if self._thread is not None:
-            raise RuntimeError("SharkWebSocketClient already started.")
-        self._should_run = True
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="shark-ws")
-        self._thread.start()
+        # transport=["websocket"] skips the polling handshake step and
+        # connects directly via WS -- confirmed acceptable since the real
+        # session's Engine.IO open packet advertised "upgrades":["websocket"].
+        self._sio.connect(self._ws_url, transports=["websocket"], wait_timeout=15)
 
     def stop(self) -> None:
-        self._should_run = False
-        if self._ws_app is not None:
-            self._ws_app.close()
-        if self._thread is not None:
-            self._thread.join(timeout=10)
+        if self._sio.connected:
+            self._sio.disconnect()
 
     def subscribe(self, symbols: list[str]) -> None:
-        with self._symbols_lock:
-            new_symbols = [s for s in symbols if s not in self._symbols]
-            self._symbols.update(symbols)
-        if new_symbols and self._ws_app is not None and self._connected_event.is_set():
-            self._send_subscribe(new_symbols)
-
-    def wait_until_connected(self, timeout_sec: float = 15.0) -> bool:
-        return self._connected_event.wait(timeout=timeout_sec)
-
-    # -- internal: connection lifecycle (identical pattern to delta_ws.py) --
-
-    def _run_loop(self) -> None:
-        while self._should_run:
-            self._connected_event.clear()
-            self._ws_app = websocket.WebSocketApp(
-                self._ws_url,
-                on_open=self._on_open,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close,
-            )
-            try:
-                self._ws_app.run_forever(ping_interval=self._ping_interval)
-            except Exception as exc:  # noqa: BLE001 -- keep the reconnect loop alive regardless of failure shape
-                logger.error("WebSocket run_forever raised: %s", exc)
-
-            if not self._should_run:
-                break
-
-            backoff = min(
-                self._reconnect_backoff_base * (2 ** self._reconnect_attempt),
-                self._reconnect_backoff_max,
-            )
-            self._reconnect_attempt += 1
-            logger.warning("Shark WebSocket disconnected -- reconnecting in %.1fs (attempt %d).",
-                            backoff, self._reconnect_attempt)
-            time.sleep(backoff)
-
-    def _on_open(self, ws: websocket.WebSocketApp) -> None:
-        logger.info("Shark WebSocket connected to %s", self._ws_url)
-        self._reconnect_attempt = 0
-        self._connected_event.set()
-        with self._symbols_lock:
-            symbols = list(self._symbols)
-        if symbols:
+        """
+        Emits a "subscribe" event with the given symbols -- see module
+        docstring's caveat that this wasn't confirmed necessary in the
+        captured session. Harmless either way: if Shark ignores this event,
+        ticker/orderBook/indexPrice events still get processed by this
+        client's handlers regardless.
+        """
+        self._pending_symbols.update(symbols)
+        if self._sio.connected:
             self._send_subscribe(symbols)
 
-    def _on_close(self, ws: websocket.WebSocketApp, close_status_code, close_msg) -> None:
-        logger.warning("Shark WebSocket closed: code=%s msg=%s", close_status_code, close_msg)
-        self._connected_event.clear()
+    def wait_until_connected(self, timeout_sec: float = 15.0) -> bool:
+        return self._sio.connected
 
-    def _on_error(self, ws: websocket.WebSocketApp, error: Exception) -> None:
-        logger.error("Shark WebSocket error: %s", error)
+    # -- internal: socketio event handlers -----------------------------------
+
+    def _on_connect(self) -> None:
+        logger.info("Shark Socket.IO connected to %s", self._ws_url)
+        if self._pending_symbols:
+            self._send_subscribe(list(self._pending_symbols))
+
+    def _on_disconnect(self) -> None:
+        logger.warning("Shark Socket.IO disconnected -- python-socketio will auto-reconnect.")
 
     def _send_subscribe(self, symbols: list[str]) -> None:
-        # UNCONFIRMED message shape -- guessed following the same
-        # {"type": ..., "payload": {...}} envelope Delta uses, since no real
-        # Shark subscribe frame was captured. REPLACE once confirmed via
-        # DevTools (see module docstring) -- do not trust this as-is.
-        payload = {
-            "type": "subscribe",
-            "payload": {
-                "channels": [
-                    {"name": _TICKER_CHANNEL_GUESS, "symbols": symbols},
-                ]
-            },
-        }
-        if self._ws_app is not None:
-            self._ws_app.send(json.dumps(payload))
-            logger.info(
-                "Sent (UNCONFIRMED shape) subscribe for channel=%s, %d symbol(s). "
-                "Verify Shark actually acknowledges this before trusting data flow.",
-                _TICKER_CHANNEL_GUESS, len(symbols),
-            )
-
-    # -- internal: message parsing -----------------------------------------
-
-    def _on_message(self, ws: websocket.WebSocketApp, message: str) -> None:
+        # Event name/payload shape here is a reasonable-convention attempt,
+        # NOT confirmed (see module docstring) -- no outgoing subscribe
+        # frame was captured to copy exactly.
         try:
-            data = json.loads(message)
-        except json.JSONDecodeError:
-            logger.warning("Received non-JSON Shark WebSocket message, ignoring: %r", message[:200])
-            return
+            self._sio.emit("subscribe", {"symbols": symbols})
+            logger.info("Emitted subscribe for %d symbol(s) (shape unconfirmed, see docstring).", len(symbols))
+        except Exception as exc:  # noqa: BLE001 -- don't let an unconfirmed emit shape crash the client
+            logger.warning("subscribe emit failed (non-fatal, unconfirmed shape): %s", exc)
 
-        # UNCONFIRMED filter -- see _send_subscribe's caveat. Log unknown
-        # message shapes at INFO (not silently dropped) while this is being
-        # bootstrapped, so real frames can be inspected and this file
-        # corrected accordingly.
-        msg_type = data.get("type")
-        if msg_type != _TICKER_CHANNEL_GUESS:
-            logger.info("Shark WS message with unrecognized type=%r, contents=%r -- inspect and "
-                        "update this client's parsing once real shapes are known.", msg_type, data)
-            return
-
-        snapshot = self._parse_ticker_message(data)
+    def _on_ticker(self, data: dict) -> None:
+        snapshot = self._parse_ticker(data)
         if snapshot is not None:
             self._on_snapshot(snapshot)
+
+    def _on_order_book(self, data: dict) -> None:
+        # Not yet wired into MarketSnapshot -- MarketSnapshot per
+        # normalization/schemas.py is a top-of-book (best_bid/best_ask)
+        # shape, not a full depth shape. Logged at DEBUG for now; revisit
+        # if/when full-depth data is actually needed (e.g. for slippage
+        # modeling -- see backtest/replay.py's KNOWN LIMITATION -- SLIPPAGE
+        # note, which is exactly the kind of thing full depth could help
+        # close eventually).
+        logger.debug("orderBook event received (not yet parsed into a snapshot): %r", data)
+
+    def _on_index_price(self, data: dict) -> None:
+        # Full confirmed shape: {"indexPrice": ..., "baseCoin": ..., "quoteCoin": ...}
+        # Not currently forwarded anywhere -- collectors/realtime_collector.py
+        # (or equivalent) would need a separate index-price sink, since
+        # MarketSnapshot's underlying_index field is populated per-instrument
+        # in _parse_ticker below, not as its own event stream. Logged for
+        # now so this data isn't silently dropped without a trace.
+        logger.debug("indexPrice event received (not yet forwarded): %r", data)
 
     @staticmethod
     def _dec_or_none(v) -> Decimal | None:
@@ -242,68 +216,54 @@ class SharkWebSocketClient:
         except (InvalidOperation, ValueError):
             return None
 
-    def _parse_ticker_message(self, data: dict) -> MarketSnapshot | None:
+    def _parse_ticker(self, data: dict) -> MarketSnapshot | None:
         """
-        UNCONFIRMED field mapping -- guessed from the REST /v1/market/
-        ticker24Hr and /v1/order/place-order response field names
-        (symbol, bidPrice/askPrice-style, baseAsset/quoteAsset) as the most
-        plausible analogues, since no real WS ticker payload was captured.
-        Correct this against a real message before trusting any output.
+        Field mapping here uses ONLY confirmed-present fields from the real
+        captured frame (see module docstring). Fields not confirmed present
+        (mark_price, greeks, open_interest, volume) are left None rather
+        than guessed at a field name that might not exist -- consistent
+        with this codebase's fail-closed principle elsewhere (e.g.
+        pricing/ev_engine.py's InsufficientDataError).
         """
         symbol = data.get("symbol")
         if not symbol:
-            logger.warning("Shark ticker message missing symbol field, dropping: %r", data)
+            logger.warning("Shark ticker event missing symbol field, dropping: %r", data)
             return None
 
         return MarketSnapshot(
-            timestamp=datetime.now(timezone.utc),
+            timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
             exchange="shark",
             instrument_id=symbol,
             best_bid=self._dec_or_none(data.get("bidPrice")),
             best_ask=self._dec_or_none(data.get("askPrice")),
-            bid_size=self._dec_or_none(data.get("bidQty")),
-            ask_size=self._dec_or_none(data.get("askQty")),
+            bid_size=self._dec_or_none(data.get("bidSize")),
+            ask_size=self._dec_or_none(data.get("askSize")),
             last_price=self._dec_or_none(data.get("lastPrice")),
-            mark_price=self._dec_or_none(data.get("markPrice")),
-            index_price=self._dec_or_none(data.get("indexPrice")),
-            iv=None,  # not confirmed present on Shark's ticker payload at all
+            mark_price=None,  # not confirmed present -- see docstring
+            index_price=None,  # delivered via separate "indexPrice" event, not per-ticker -- see _on_index_price
+            iv=self._dec_or_none(data.get("askIv")),  # using ask-side IV as the confirmed-present IV field;
+                                                        # bidIv also exists but MarketSnapshot has one iv slot --
+                                                        # revisit which side is more appropriate once this is
+                                                        # actually consumed by pricing/ev_engine.py for Shark legs.
             delta=None,
             gamma=None,
             theta=None,
             vega=None,
-            open_interest=self._dec_or_none(data.get("openInterest")),
-            volume_24h=self._dec_or_none(data.get("volume")),
-            underlying_spot=self._dec_or_none(data.get("indexPrice")),
-            underlying_index=self._dec_or_none(data.get("indexPrice")),
+            open_interest=None,
+            volume_24h=None,
+            underlying_spot=None,
+            underlying_index=None,
             underlying_futures=None,
-            funding_rate=self._dec_or_none(data.get("fundingRate")),
+            funding_rate=None,
         )
 
 
-# -- Listen Key lifecycle (Authenticated WebSocket) --------------------------
-#
-# PLACEHOLDER PATHS -- not confirmed. Guessed following the Binance/MEXC
-# convention (`/v1/userDataStream` for POST/PUT/DELETE) since Shark's docs
-# sidebar confirms this feature EXISTS (Create/Get/Update/Delete Listen Key
-# are real section headers) but the actual paths were never reached in any
-# fetch attempt. Confirm via DevTools or by requesting docs from Shark
-# support before relying on these for anything real.
-
-_LISTEN_KEY_PATH_GUESS = "/v1/userDataStream"
-
-
-def create_listen_key(adapter) -> str:
-    """Takes a SharkAdapter (for its signed _post helper) -- PLACEHOLDER path, unconfirmed."""
-    resp = adapter._post(_LISTEN_KEY_PATH_GUESS)
-    return resp["listenKey"]
-
-
-def keepalive_listen_key(adapter, listen_key: str) -> None:
-    raise NotImplementedError(
-        "Needs a signed PUT helper on SharkAdapter (not yet implemented) and a confirmed "
-        "path -- see module docstring."
-    )
-
-
-def delete_listen_key(adapter, listen_key: str) -> None:
-    adapter._delete(_LISTEN_KEY_PATH_GUESS, {"listenKey": listen_key})
+def get_confirmed_ws_url_instructions() -> str:
+    """
+    Not a runtime function -- a documentation helper for whoever picks this
+    up next. Fastest way to confirm _WS_URL_INFERRED exactly, if it turns
+    out to matter (e.g. if connecting to the inferred URL fails):
+    browser DevTools -> Network tab -> filter "WS" -> click one of the
+    socket.io rows -> Headers tab -> Request URL, top of the panel.
+    """
+    return __doc__ or ""
