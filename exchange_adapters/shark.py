@@ -3,9 +3,10 @@ Shark Exchange (sharkexchange.in) REST adapter.
 
 CONFIRMATION STATUS -- read this before trusting anything below with real
 money. Everything in this file was built from Shark's own public docs
-(docs.sharkexchange.in) and legal Trading Policy (sharkexchange.in/legal/
-trading-policy), not from guessing -- but those two sources don't cover the
-same product, and that gap matters:
+(docs.sharkexchange.in), legal Trading Policy (sharkexchange.in/legal/
+trading-policy), and -- as of 2026-08-23 -- real frames/requests captured
+from a live options session via browser DevTools. Three different sources,
+and they don't all cover the same product, so the gap matters:
 
 CONFIRMED (from docs.sharkexchange.in, retrieved 2026-08-23):
   - Auth scheme: HMAC-SHA256 over the query string (GET) or JSON body
@@ -22,19 +23,40 @@ CONFIRMED (from docs.sharkexchange.in, retrieved 2026-08-23):
   - Rate limits: place-order 20/1s, delete-order 30/1m, everything else
     60/1m.
 
+CONFIRMED (from a live DevTools capture against a real options session,
+2026-08-23 -- see exchange_adapters/shark_ws.py's module docstring for the
+full writeup of the WebSocket side of this same capture):
+  - Real options symbol format: "BTC-24AUG26-73000-P-USDT" /
+    "BTC-24AUG26-75000-C-USDT" -- pattern {BASE}-{DD}{MMM}{YY}-{STRIKE}-
+    {C|P}-{QUOTE}. This is the confirmed instrument_id shape for options on
+    Shark -- use this directly when constructing OrderRequest.instrument_id
+    for an options order, per place_order()'s docstring below.
+  - The options page's Fetch/XHR traffic surfaced REST endpoint NAMES not
+    in the public docs at all: `basePairs`, `delivery-times`,
+    `options-tier-info`, `instrument-info`, `exchangeInfo` (options-scoped
+    -- likely different from or in addition to /v1/exchange/exchangeInfo's
+    futures-only response, see probe_exchange_info()'s docstring), and a
+    paginated `list?page=...&pageSize=...&isPast=...` endpoint (plausibly
+    the expiry-date or contract list). These are NAMES only -- the request
+    host and full response shape for each were not captured (the DevTools
+    session showed the Name column of the Network panel but not every
+    request's Headers/Response detail). This is the single most promising
+    concrete lead for finishing get_option_chain()/get_instruments() --
+    capturing the Headers + Response of any one of these (Network tab ->
+    click the request -> Headers for URL, Response for body) would very
+    likely unblock both methods in one step.
+
 NOT CONFIRMED -- genuinely unknown, not guessed:
-  - Shark's public API reference has NO Options section at all, despite
-    Options being a live, documented product (with its own legal Trading
-    Policy, its own settlement-price formula, its own pages at
-    sharkexchange.in/options/btcusdt) -- the REST reference only documents
-    Futures. Every field name, symbol format, and required parameter for
-    placing an OPTIONS order via this API is unverified.
-  - `/v1/exchange/exchangeInfo` is referenced only in the docs changelog
-    (as an error-code entry), never documented with a request/response
-    shape. This is the most promising lead for discovering whether options
-    are exposed via this API at all, and if so what their instrument
-    listing looks like -- see get_option_chain()'s docstring for the
-    concrete next step to resolve this.
+  - The exact host + full response shape for the options-specific
+    endpoints named above.
+  - `/v1/exchange/exchangeInfo` (no version prefix disambiguation captured)
+    was independently confirmed via probe_exchange_info() to return
+    FUTURES-ONLY data (every one of ~400 contracts returned was
+    `contractType: PERPETUAL` or `TRADIFI_PERPETUAL`, zero options). The
+    options-scoped `exchangeInfo` request seen in the Fetch/XHR capture
+    above may be a different endpoint/host entirely, not the same call --
+    do not assume they're the same until the options one's actual URL is
+    confirmed.
   - get_fees() below is NOT wired to a real endpoint -- no fee-schedule API
     endpoint was found in the docs; sharkexchange.in/fee-structure is a
     webpage, not confirmed as an API. This raises NotImplementedError
@@ -77,6 +99,11 @@ logger = logging.getLogger("exchange_adapters.shark")
 
 _BASE_URL = "https://api.sharkexchange.in"
 _REQUEST_TIMEOUT_SEC = 10
+
+# Confirmed 2026-08-23 via live DevTools capture -- see module docstring.
+# Example: "BTC-24AUG26-73000-P-USDT" (BTC put, strike 73000, expires
+# 24-Aug-2026, USDT-settled).
+OPTIONS_SYMBOL_FORMAT_EXAMPLE = "BTC-24AUG26-73000-P-USDT"
 
 
 class SharkAdapterError(RuntimeError):
@@ -162,14 +189,21 @@ class SharkAdapter:
 
     def probe_exchange_info(self) -> Any:
         """
-        Calls the undocumented-but-referenced /v1/exchange/exchangeInfo
-        endpoint and returns the raw response, unparsed. This is the
-        diagnostic entry point for discovering whether Options are exposed
-        via this REST API and what their instrument spec looks like --
-        run this FIRST, inspect the raw output for anything resembling
-        strike/optionType/expiry fields, and only then decide how (or
-        whether) to implement get_option_chain() for real. Deliberately not
-        parsed into OptionContract here, since the shape is unknown.
+        Calls /v1/exchange/exchangeInfo and returns the raw response,
+        unparsed. INDEPENDENTLY CONFIRMED (2026-08-23) to return
+        FUTURES-ONLY data -- every one of ~400 returned contracts was
+        `contractType: PERPETUAL` or `TRADIFI_PERPETUAL`, zero options
+        entries of any kind. Do not re-run this expecting options data;
+        it's a closed lead for that purpose. The response also confirmed
+        Shark is very likely running on Pi42's white-label backend --
+        `iconUrl` fields point at `storage.googleapis.com/pi42-dev-static/`
+        and `pi42-prod-static` buckets, not a Shark-branded bucket.
+
+        For OPTIONS instrument data, see the module docstring's note on
+        `basePairs`/`delivery-times`/`options-tier-info`/`instrument-info`/
+        options-scoped `exchangeInfo` -- endpoint NAMES observed in a
+        Fetch/XHR capture of the live options page, but not yet confirmed
+        with a real host+response. That's the next lead, not this method.
         """
         return self._get("/v1/exchange/exchangeInfo")
 
@@ -194,12 +228,18 @@ class SharkAdapter:
 
     def place_order(self, order: OrderRequest, extra_params: dict | None = None) -> OrderResult:
         """
-        CONFIRMED SHAPE IS FOR FUTURES ONLY. Do not call this for an options
-        instrument_id until probe_exchange_info() (or direct empirical
-        testing with a single minimal-size order) has confirmed what
-        `symbol` format and `contractType`/equivalent options need. Passing
-        `extra_params` lets a caller inject option-specific fields once
-        they're known, without this method having to guess them.
+        CONFIRMED SHAPE IS FOR FUTURES ONLY -- this has NOT been tested
+        against an options instrument_id (e.g. "BTC-24AUG26-73000-P-USDT",
+        confirmed real format per module docstring) even though the symbol
+        format is now known. Symbol format alone doesn't confirm the rest
+        of the payload (contractType value, whether `marginAsset`/
+        `reduceOnly` apply the same way to an options position) is correct
+        for options. Do not place a real options order through this method
+        until that's been verified -- start with the smallest possible
+        size and confirm the response shape matches expectations before
+        trusting it for anything bigger. `extra_params` lets a caller
+        inject option-specific fields once/if they're discovered to be
+        needed, without this method having to guess them.
         """
         params = {
             "placeType": "ORDER_FORM",
@@ -247,15 +287,23 @@ class SharkAdapter:
 
     def get_instruments(self) -> list[OptionContract]:
         raise NotImplementedError(
-            "Shark's public API docs don't cover options instrument listing. "
-            "Call probe_exchange_info() first and inspect the raw response for "
-            "strike/expiry/optionType-shaped fields before implementing this."
+            "probe_exchange_info() is confirmed futures-only (see its docstring). The real "
+            "lead now is the options-scoped `instrument-info`/`basePairs`/`options-tier-info` "
+            "endpoints observed in a live options-page Fetch/XHR capture 2026-08-23 -- capture "
+            "one of those requests' Headers (for host+path) and Response (for shape) via "
+            "browser DevTools before implementing this."
         )
 
     def get_option_chain(self, underlying: str, expiry: datetime | None = None) -> list[OptionContract]:
         raise NotImplementedError(
-            "Same gap as get_instruments() -- see that method's docstring and "
-            "probe_exchange_info()."
+            "Same gap as get_instruments() -- see that method's docstring. Note: "
+            "exchange_adapters/shark_ws.py's live-captured WebSocket 'ticker' events already "
+            "confirm the real options symbol format (OPTIONS_SYMBOL_FORMAT_EXAMPLE, this "
+            "module) and live bid/ask/IV per-strike -- for an immediate unblock without "
+            "waiting on the REST instrument-listing endpoint, it may be faster to build the "
+            "option chain by listening to shark_ws.py's ticker stream for a known underlying/"
+            "expiry combination for a short warmup period and inferring the strike ladder from "
+            "observed symbols, rather than waiting on this REST method."
         )
 
     def get_orderbook(self, instrument_id: str, depth: int = 5) -> OrderBookSnapshot:
@@ -265,6 +313,11 @@ class SharkAdapter:
         # rendered response examples) -- this is a best-effort parse assuming
         # a conventional {"bids": [[price, size], ...], "asks": [...]}, shape
         # and MUST be verified against a real response before trusting it.
+        # NOTE: shark_ws.py's live-captured "orderBook" WS event DOES confirm
+        # the bids shape as [[price_str, size_str], ...] (asks assumed
+        # symmetric, not independently confirmed) -- consistent with what's
+        # assumed here, which is reassuring but still not the same thing as
+        # confirming this specific REST endpoint's response shape directly.
         bids = [(Decimal(str(p)), Decimal(str(s))) for p, s in raw.get("bids", [])]
         asks = [(Decimal(str(p)), Decimal(str(s))) for p, s in raw.get("asks", [])]
         return OrderBookSnapshot(
@@ -274,10 +327,13 @@ class SharkAdapter:
     def get_ticker(self, instrument_id: str) -> TickerSnapshot:
         raw = self.get_ticker_24hr(instrument_id)
         # Same caveat as get_orderbook: field names below are a best-effort
-        # guess at a conventional 24hr-ticker shape, NOT confirmed against a
-        # real Shark response (docs truncated before showing one). Verify
-        # against actual output before trusting any field here, especially
-        # for options symbols which aren't confirmed to work at all.
+        # guess at a conventional 24hr-ticker shape for FUTURES, NOT
+        # confirmed against a real Shark response, and NOT the same as
+        # options -- for options tickers, prefer shark_ws.py's live-captured
+        # "ticker" WS event fields (symbol, bidPrice, bidSize, bidIv,
+        # askPrice, askSize, askIv, lastPrice, highPrice24h, lowPrice24h --
+        # all confirmed real) over this REST method entirely, until this
+        # method's own response shape is independently verified.
         snapshot = MarketSnapshot(
             timestamp=datetime.now(timezone.utc),
             exchange="shark",
@@ -323,7 +379,12 @@ class SharkAdapter:
             "No confirmed fee-schedule API endpoint found. sharkexchange.in/fee-structure "
             "is a webpage, not confirmed as an API response. Per this codebase's "
             "fail-closed principle (see pricing/ev_engine.py InsufficientDataError), "
-            "this does not return a guessed/hardcoded fee rate."
+            "this does not return a guessed/hardcoded fee rate. NOTE: the 2026-08-23 "
+            "Fetch/XHR capture also showed a `fee-structure?_rsc=epzn0` request, but the "
+            "`_rsc` query param is a Next.js React Server Component page-fetch marker, "
+            "meaning that request is very likely the fee-structure WEBPAGE's own data "
+            "loading, not a general-purpose fee API -- worth checking, but don't assume "
+            "it's usable without confirming the response is actually machine-readable JSON."
         )
 
     def get_contract_specification(self, instrument_id: str) -> ContractSpec:
