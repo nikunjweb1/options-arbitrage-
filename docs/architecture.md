@@ -13,6 +13,15 @@ to cut anything that isn't load-bearing. This revision compresses Phases 5-10 in
 faster versions. **What did not change:** backtesting, paper trading, and the risk/kill-switch
 layer are still in the plan. See Section L for the compressed plan.
 
+**v2.1 revision note (2026-08-23):** The project owner shared a detailed third-party analysis
+(a NotebookLM breakdown of the specific YouTube video this whole project started from) that
+sharpens the strategy definition considerably. See Section M for the full writeup — short
+version: it mostly *confirms* this architecture's existing math and fee model rather than
+requiring a rewrite, and it adds one important hard rule (net-credit-only entry) that wasn't
+previously enforced as a gate. It does **not** resolve the still-open CoinSwitch/Shark
+verification blocker — a video's claims about a competitor's settlement mechanics are not a
+substitute for that exchange's own documentation, however carefully the video is analyzed.
+
 ---
 
 ## 0. Executive summary (read this first)
@@ -23,13 +32,22 @@ settles *all* options contracts — daily, weekly, monthly, quarterly — at **5
 computed from a 30-minute TWAP of the index price. "D1"/"D2"/weekly maturities differ by
 *which day* they settle, not *what time of day*.
 
+**Clarification (added 2026-08-23, see Section M):** this finding does **not** contradict the
+source video, and shouldn't be read as having debunked the strategy. The video's actual claim
+(per Section M's detailed breakdown) is an asymmetric two-exchange comparison — CoinSwitch/Shark
+settling at 1:30 PM IST, Delta settling at 5:30 PM IST — not a claim that Delta itself has two
+different intraday settlement times. Delta's fixed 5:30 PM is fully *consistent* with that
+claim. The open question was, and remains, whether CoinSwitch and/or Shark actually settle at
+1:30 PM IST as claimed — which still requires their own official documentation to confirm, not
+assumption from either the original brief or this new video analysis.
+
 **Exchange readiness (researched, not assumed):**
 
 | Exchange | Public options API | Settlement mechanics documented? | Verdict |
 |---|---|---|---|
 | **Delta Exchange India** | Yes — full public REST v2 + WebSocket, testnet, official SDKs | Yes: European, cash-settled, 30-min TWAP, fixed 5:30 PM IST | **Primary exchange, in active use. Phase 2/3/5 all built and validated.** |
-| **CoinSwitch PRO** | Options API "available on request" | Marketing language only, no settlement docs found | Still blocked, deferred (Section L). |
-| **Shark Exchange** | No public options API documentation found | Unknown | Dropped from scope. |
+| **CoinSwitch PRO** | Options API "available on request" | Marketing language only, no settlement docs found. Video claims 1:30 PM IST settlement — unverified against official docs (see Section M.4). | Still blocked, deferred (Section L). |
+| **Shark Exchange** | No public options API documentation found | Video claims 1:30 PM IST settlement, same as CoinSwitch — unverified against official docs (see Section M.4). | Dropped from scope pending docs. |
 
 ---
 
@@ -70,6 +88,7 @@ computed from a 30-minute TWAP of the index price. "D1"/"D2"/weekly maturities d
 │  PRICING / EV / MONTE CARLO ENGINE -- DONE, exit criterion met        │
 │  lean version per Section L — real bid/ask, real fees, real EV        │
 │  292/404 priced candidates show positive EV in the latest live run    │
+│  NEXT: add MIN_NET_CREDIT entry gate per Section M.2                  │
 └───────────────┬────────────────────────────────────────────────────-┘
                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -90,10 +109,14 @@ computed from a 30-minute TWAP of the index price. "D1"/"D2"/weekly maturities d
                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │   LEG EXECUTION ENGINE (built, disabled: LIVE=False)                  │
+│   Exit rule for THIS strategy = Exit A (close long leg AT T1),        │
+│   confirmed as the video's own mechanism, not just our default -      │
+│   see Section M.3                                                      │
 └──────────────────┬───────────────────────────────────────────────────┘
                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │   RISK ENGINE + KILL SWITCH (built alongside execution engine)        │
+│   MIN_NET_CREDIT hard gate added per Section M.2                       │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -126,7 +149,7 @@ retries transient network errors with backoff), `exchange_adapters/delta_ws.py` 
 |---|---|---|
 | REST base URL | `https://api.india.delta.exchange` (prod) / `cdn-ind.testnet.deltaex.org` (testnet) | Not publicly documented for options |
 | WebSocket | `wss://socket.india.delta.exchange` | Unknown for options |
-| Settlement time | Fixed at 5:30 PM IST for every contract | Unclear |
+| Settlement time | Fixed at 5:30 PM IST for every contract | Claimed 1:30 PM IST by source video (Section M.4) — unverified |
 | Settlement price formula | `max(30-min TWAP index − strike, 0)` for calls, mirrored for puts | Not documented publicly |
 | Fees | Maker/taker on notional; capped at 7.5–12.5% of premium; zero settlement fee on OTM; 18% GST (India accounts) | Not documented publicly |
 
@@ -138,6 +161,14 @@ All seven checks (settlement clock, settlement price basis, settlement currency,
 multiplier/lot size, European vs. Turbo variant, index construction, fee structure asymmetry)
 are enforced as required, checked fields in `matching/engine.py`. Confirmed working against
 374 real Delta contracts (Phase 3 run).
+
+**Note on contract multiplier ratios (2026-08-23):** the source video claims a specific
+CoinSwitch:Delta contract-size ratio ("10 slots on CoinSwitch = 100 slots on Delta"). This
+number is **never hardcoded anywhere in this system** — `matching/engine.py`'s Section C.4
+check always pulls `contract_multiplier` from each exchange's own live
+`get_contract_specification()` response. The video's ratio is a useful sanity-check target
+once CoinSwitch is integrated, not a value to trust directly, since a wrong hardcoded ratio
+is exactly how you end up "90% unhedged" (the video's own phrase for this failure mode).
 
 ---
 
@@ -166,6 +197,11 @@ silently assumed to be zero, but it means every EV number in the current live-ru
 optimistic relative to what real execution would achieve, especially on the sub-$2 premiums
 typical of this candidate pool. Worth modeling explicitly before Phase 7 (paper trading).
 
+**New hard rule from Section M.2: `Net entry cost` (equivalently `Gross entry credit`) MUST
+be > 0 (a real net credit, with a safety margin) for a candidate to be tradeable at all.**
+This isn't new math — it's a **gating threshold** on math that already existed. See Section
+M.2 for the reasoning and Section H for how this maps onto `MIN_EXPECTED_PROFIT`/risk limits.
+
 ### D.3 Expected value of the long leg at T1
 
 ```
@@ -183,6 +219,11 @@ widened from an initial 5 points to 21 during live-run debugging (see Status sec
 after a too-narrow grid was initially suspected as the cause of an exact 0%/100% P(profit)
 split; widening the grid alone didn't fix it (the real cause was Bug #2's unit mismatch), but
 21 points is a more defensible resolution regardless and was kept.
+
+**Confirms Section M's "ATM jackpot" scenario directly:** this grid structurally produces its
+highest `V_long(T1)` values exactly when `S_T1 ≈ K` (at-the-money at T1) — matching the
+video's own claim that maximum remaining time value, and therefore maximum profit, occurs
+right at the strike. Nothing needed to change here; the existing grid already captures this.
 
 ### D.4 P&L per simulated path
 
@@ -230,6 +271,11 @@ SQLite, `db/schema.sql`. `instruments`, `market_data`, `candidate_pairs`, `signa
 
 - One window, one underlying (BTC), one entry threshold, first pass.
 - If this shows no edge: "no edge, stop here." If positive: the fuller v1 matrix becomes worth building.
+- **Named stress scenarios added from Section M.5's four-scenario breakdown** (flat/OTM,
+  ATM "jackpot", high-momentum/deep-ITM-or-OTM, execution-failure/unhedged) — these map onto
+  specific slices of the existing price grid (D.3) plus one new explicit test: a forced
+  "long leg never closed at T1" path, to quantify Section M's Scenario 4 (execution failure)
+  rather than leaving it as a purely qualitative risk.
 
 ### G.3 What's explicitly deferred
 
@@ -240,13 +286,29 @@ in the plan, after a lean pass justifies the time.
 
 ## H. Risk model — NOT COMPRESSED
 
-(Unchanged from v1 — see prior revisions. Built alongside the execution engine, not deferred.)
+(Unchanged from v1 in structure — see prior revisions for the full table.) **Section M cross-
+check (2026-08-23):** the video's own "five hidden risks" map cleanly onto risk categories
+already in this table, confirming the existing taxonomy rather than requiring new categories:
+
+| Video's risk (Section M) | Existing risk-model row |
+|---|---|
+| Momentum/net-debit math flaw | Market risk + new `MIN_NET_CREDIT` gate (Section M.2/D.2) |
+| Fee stacking (4 fee points) | Already modeled: `short_entry_fee`, `long_entry_fee`, `settlement_fee`, `long_exit_fee` all present in `pricing/ev_engine.py` and `backtest/engine.py` |
+| Execution latency / legging-in | Legging risk (already modeled, incl. `backtest/engine.py`'s legging-failure simulation) |
+| Basis risk (index discrepancy) | Settlement risk + Contract-spec risk (Section C.2/C.6) |
+| Contract multiplier mismatch ("90% unhedged") | Contract-spec risk (Section C.4) — reinforces why multiplier is never hardcoded (see Section C note above) |
+
+One genuinely new item: **`MIN_NET_CREDIT` should be added to the hard-limits list in Section
+24 of the original master prompt** (`MAX_TOTAL_CAPITAL`, `MAX_MARGIN_PER_TRADE`, etc.) — a
+candidate with `Net_entry_cost <= 0` should be a `DO NOT ENTER` case in Phase 9's risk engine,
+not merely a lower-ranked one.
 
 ---
 
 ## I. Implementation roadmap — STATUS AS OF v2
 
-**Phase 1 — Research.** ✅ Done.
+**Phase 1 — Research.** ✅ Done. **Sharpened targets to verify for CoinSwitch/Shark added,
+Section M.4 — not yet resolved.**
 
 **Phase 2 — Market-data collectors.** ✅ Done.
 
@@ -261,34 +323,32 @@ list (1,504 at the original Phase 3 run; re-run `matching.run_matcher` periodica
 - **Two real bugs found and fixed via live diagnostic evidence** (not guessed): (1)
   `contract_multiplier` omitted from `short_payoff`/`v_long`; (2) `contract_multiplier` also
   omitted from the premium side (`short_bid`/`long_ask`) — confirmed via `pricing/diagnose_pair.py`
-  against a real quote, and the actual explanation for the first live run's wildly implausible
-  EV numbers (~1000x too large) and the exact-0%/100% `P(profit)` split.
+  against a real quote.
 - **Final confirmed-good live run (2026-08-23):** 674 non-expired candidates loaded, 404
   priced (270 skipped for no executable live data), 292/404 (72%) positive EV, `P(profit)`
-  distributed across a real range for all 404 results (zero landed at exactly 0.0 or 1.0).
-  EV magnitudes now the same order as net entry cost.
-- **Known gap to carry into Phase 6/7:** `expected_slippage` (Section D.2) is not yet modeled;
-  on the sub-$2 premiums typical here, this could matter a lot. 40% of live-data fetch attempts
-  found no executable bid/ask — real testnet illiquidity to keep in mind for position sizing.
-- Exit criteria (lean): EV, net-of-fees profit, and a probability-of-profit estimate computed
-  for real candidates using real bid/ask pulled live, not backfilled. **Met.**
+  distributed across a real range for all 404 results.
+- **NOT YET IMPLEMENTED, now a concrete near-term task per Section M.2:** the
+  `MIN_NET_CREDIT` hard gate. `run_pricing.py` currently ranks and reports all 404 priced
+  candidates, including net-debit ones, whose worst-case loss per Section M.1's math equals
+  the entry debit itself. This should be filtered/flagged explicitly, not just left implicit
+  in the EV ranking.
+- **Known gap to carry into Phase 6/7:** `expected_slippage` (Section D.2) is not yet modeled.
 
-**Phase 6 — Lean backtester.** Next up. Per Section G.2.
-- Exit criteria (lean): one honest report, whatever window the data supports, explicitly
-  labeled "lean pass" — a clear go/no-go signal on the fuller v1 backtest matrix. Should
-  explicitly account for the slippage gap flagged above rather than inheriting Phase 5's
-  optimistic-by-construction numbers unchanged.
+**Phase 6 — Lean backtester.** Next up. Per Section G.2, now including Section M's four named
+stress scenarios.
 
 **Phase 7 — Short paper trading window.** Sized to observed signal frequency from Phase 5/6.
 
 **Phase 8 — Execution engine + Phase 9 — Risk/kill switch.** Built together.
-`LIVE_TRADING = FALSE` hardcoded regardless.
+`LIVE_TRADING = FALSE` hardcoded regardless. Execution engine's default exit rule for this
+strategy confirmed as Exit A (close long leg at T1) per Section M.3 — matches the video's own
+mechanism exactly, so this isn't an open design choice anymore for this specific strategy.
 
 **Phase 10 — Live trading.** Enabled only after explicit, separate approval, and only if the
 lean backtest + paper trading both show a real, cost-inclusive, positive edge.
 
 **Explicitly deferred (not cancelled):** full v1 backtest matrix, dashboard, alerting,
-CoinSwitch/Shark adapters.
+CoinSwitch/Shark adapters (still blocked on real docs — see Section M.4).
 
 ---
 
@@ -296,8 +356,8 @@ CoinSwitch/Shark adapters.
 
 Answered: yes, same-exchange calendar-spread candidates exist structurally (hundreds found),
 and a meaningful fraction (72% of what could be priced in the latest run) show positive lean-EV
-after real fees, before slippage. Whether that survives slippage modeling and a real backtest is
-Phase 6's question now.
+after real fees, before slippage. Whether that survives slippage modeling, the `MIN_NET_CREDIT`
+gate, and a real backtest is Phase 6's question now.
 
 ---
 
@@ -309,6 +369,14 @@ Phase 6's question now.
 | **put-call-arb** (`lubintan`) | None found (all rights reserved) | Studied for methodology only; not copied. |
 | **Deribit MCP** | MIT | Not currently in use. |
 | **"CORP"** | Unknown | Still not identified — deprioritized. |
+
+**New item (2026-08-23): "Mirror Web platform"**, mentioned in the source video as a
+third-party execution/education tool. Not researched, not integrated, and not currently
+planned to be — this system's execution engine (Phase 8) is being built as our own adapter-
+based architecture (Section A.3), not as a wrapper around an unverified third-party trading
+tool with unknown API access, reliability, or security posture. If there's a specific reason
+to reconsider this, that's a separate decision to make deliberately, not something to fold in
+because a video mentioned it.
 
 ---
 
@@ -325,21 +393,126 @@ to Phase 6, not a reason to declare victory.
 Real bid/ask pulled live for both legs, real fees, real net entry cost (minus the
 not-yet-modeled slippage term). `pricing/run_pricing.py` + `pricing/ev_engine.py`. Output:
 net EV, probability-of-profit, ranked. Confirmed working with sane numbers as of 2026-08-23.
+**Next code change: add the `MIN_NET_CREDIT` gate from Section M.2.**
 
 ### L.3 Lean backtest + short paper trading (replaces full Phase 6/7) — NEXT
 
 - Backtest: one pass, whatever historical window Delta's API exposes, one underlying, one
-  threshold. Should incorporate a slippage estimate given Phase 5's disclosed gap.
+  threshold. Should incorporate a slippage estimate given Phase 5's disclosed gap, and the
+  four named scenarios from Section M.5/G.2.
 - Paper trading: window length derived from Phase 5/6's findings.
 
 ### L.4 Risk engine + kill switch: not deferred
 
-Built alongside the execution engine (Phase 8/9).
+Built alongside the execution engine (Phase 8/9). `MIN_NET_CREDIT` added to the hard-limit set.
 
 ### L.5 What "later" actually means
 
 Deferred items come back into scope if and when a lean pass shows a real edge worth the
 additional engineering time.
+
+---
+
+## M. Strategy definition refinement (source: third-party video analysis, 2026-08-23)
+
+The project owner shared a detailed breakdown (a NotebookLM analysis of the specific YouTube
+video — presenter identified as Pushkar Raj Thakur — that originally inspired this project)
+covering the exact mechanics, worked examples, and stated risks of the strategy. This section
+records what was learned and, critically, distinguishes **video claims** (unverified against
+primary exchange documentation) from **things this analysis independently confirmed are sound
+options math** (verifiable from first principles, regardless of what the video's source
+exchanges turn out to actually do).
+
+### M.1 The core mechanism, as described in the video
+
+- Sell (short) an option on the earlier-expiry exchange (CoinSwitch or Shark, claimed 1:30 PM
+  IST expiry). Buy (long) the same underlying/strike option on the later-expiry exchange
+  (Delta, confirmed 5:30 PM IST settlement — see Section 0).
+- At 1:30 PM, the short leg **expires automatically**. If OTM, it settles at $0 and the seller
+  keeps the full premium.
+- The long leg does **not** expire at 1:30 PM — it has ~4 hours of remaining life. It must be
+  **manually closed (sold) at 1:30 PM** to capture its remaining time value, rather than held
+  to its own 5:30 PM expiry. This is exactly Exit A in this project's execution-engine design
+  (Section 14 of the original master prompt) — the video's own mechanism confirms Exit A as
+  the right *default*, not just one option among several, for this specific strategy.
+- **This part is sound, first-principles options math, independent of whether the video's
+  specific exchange claims are correct**: this is a textbook calendar-spread payoff shape.
+  Maximum value of the long leg's remaining time value occurs when the underlying is
+  at-the-money at T1; the payoff degrades (time value collapses toward zero) the further the
+  underlying moves from the strike in either direction by T1.
+
+### M.2 The net-credit rule — the one genuinely new hard requirement
+
+The video's own worked examples (reconstructed and checked in the shared analysis) show:
+
+- **Net-credit entry** (`B_short > A_long`, i.e. `Net_entry_cost > 0`): in the worst case
+  (a violent move collapsing the long leg's time value to ~0), the trade still nets out to
+  **at least the entry credit** — bounded, not a loss, assuming the hedge ratio and both legs'
+  execution are correct.
+- **Net-debit entry** (`B_short < A_long`, i.e. `Net_entry_cost < 0`): in that same worst case,
+  the trade loses **the full entry debit**. There is no scenario in this payoff structure where
+  a net-debit entry does better than net-credit in the tail — this checks out mathematically
+  (calendar spreads have bounded, strike-centered maximum value; a debit paid for that bounded
+  structure is money that can be fully lost if the structure's value collapses to its floor).
+
+**This is not new to our math — Section D.2/D.4 already computes exactly this P&L — but it
+was not previously enforced as a gate.** `pricing/run_pricing.py` currently ranks and surfaces
+both net-credit and net-debit candidates by EV alone. Per this finding, **`Net_entry_cost <= 0`
+should be treated as a hard `DO NOT ENTER` condition** (a new `MIN_NET_CREDIT` risk limit,
+Section H), not just a candidate that scores lower. This is the one concrete, actionable
+change this analysis produces — everything else confirms existing design rather than changing
+it.
+
+### M.3 Exit timing confirmed, not just assumed
+
+The video is explicit and repeated on this point: the long leg must be closed **at the short
+leg's expiry (T1)**, and forgetting to do so (its own "Scenario 4") leaves an unhedged position
+that decays toward the long leg's own expiry with real loss potential. This directly validates
+building `EXIT_TRIGGER = short_leg_expired` as the primary, default automated exit condition
+for Phase 8's execution engine for this specific strategy — not a configurable choice to leave
+open-ended, given how explicitly both the video and this project's own math agree on it.
+
+### M.4 What remains genuinely unverified — sharpened, not resolved
+
+A YouTube video, however carefully analyzed, is not primary-source exchange documentation.
+The specific, falsifiable claims that still need checking against CoinSwitch's and Shark's own
+official docs (or, failing that, direct empirical observation of a real contract's settlement)
+before this cross-exchange leg of the strategy is trusted with real capital:
+
+1. **Do CoinSwitch and/or Shark actually settle options at exactly 1:30 PM IST?** (Video claim,
+   unverified — Section 0/B.)
+2. **What is their settlement price formula** (TWAP, last-price, their own index)? Getting this
+   wrong is exactly the "basis risk" the video itself flags (Section C.2/C.6) — a $63,010 vs.
+   $62,995 settlement discrepancy across exchanges can eat the entire arbitrage margin on its
+   own, independent of everything else being right.
+3. **What is the real, current contract-multiplier ratio between CoinSwitch/Shark and Delta**
+   for a given underlying? The video's "10:100" example is a snapshot, not a documented,
+   stable constant — must be pulled live via `get_contract_specification()` every time, per
+   Section C's existing (and unchanged) design.
+4. **Does CoinSwitch's/Shark's API even support the timely manual-close-at-T1 execution this
+   strategy structurally requires?** If placing an order at exactly 1:30 PM IST is unreliable
+   on their API (rate limits, latency, downtime), that's Section M.3's exit trigger becoming
+   Section M.1's "Scenario 4" (execution failure) by default, not by exception.
+
+None of this is resolvable from a video, however good the analysis. **This remains the single
+highest-priority blocker to trading the actual cross-exchange version of this strategy for
+real money**, and this new information sharpens exactly what to check for, rather than
+providing a shortcut around checking it.
+
+### M.5 Four scenarios — adopted as named stress-test cases (Section G.2)
+
+| # | Scenario | Outcome for net-credit entry | Outcome for net-debit entry |
+|---|---|---|---|
+| 1 | Flat/OTM at T1 | Profit = credit + remaining long-leg time value | Same shape, smaller/negative depending on magnitude |
+| 2 | ATM "jackpot" at T1 | Maximum profit (long leg retains maximum time value) | Same direction, smaller magnitude |
+| 3 | High momentum (deep ITM or deep OTM at T1) | Profit collapses toward the entry credit (bounded, still ≥ 0 if hedge/execution correct) | **Loss equal to the full entry debit** |
+| 4 | Execution failure (long leg not closed at T1) | Unhedged decay risk regardless of entry credit/debit — becomes a directional bet, not an arbitrage | Same, compounded by starting already underwater |
+
+Scenarios 1-3 are natural slices of the existing D.3 price grid (already implemented).
+Scenario 4 requires one new, explicit backtest/paper-trading test path — "what if the exit
+trigger fires late or not at all" — since nothing in the current `backtest/engine.py` or
+`pricing/ev_engine.py` models a missed or delayed exit. Worth adding in Phase 6/7, not Phase 5,
+since it's fundamentally about execution reliability, not pricing.
 
 ---
 
@@ -360,27 +533,22 @@ additional engineering time.
   - **Bug #2** (2026-08-22, the real explanation for the first live run's implausible numbers):
     `contract_multiplier` also never applied to the premium side (`short_bid`/`long_ask`),
     leaving `net_entry_cost` ~1000x too large relative to the correctly-scaled payoff terms.
-    Found via `pricing/diagnose_pair.py` against real live data (best_bid=12750, spot=77223.2,
-    strike=64400 only reconciles as a per-1-BTC quote). Fixed; regression test
+    Found via `pricing/diagnose_pair.py` against real live data. Fixed; regression test
     (`TestPremiumScalingUnitConsistency`) built directly from the real diagnosed numbers.
   - Grid widened from 5 to 21 price points (63 total scenarios) during the same debugging pass.
-  - Expired-short-leg filtering added at load time after discovering `candidate_pairs` can go
-    stale within hours (same-day D1 contracts), not just days.
-  - Diagnostic fields (`time_to_short_expiry_hours`, `sigma_move`, `base_iv_used`) added to
-    `EVResult` for visibility into *why* a given P(profit) came out the way it did.
   - **Final confirmed-good run (2026-08-23):** 404 priced, 292 positive EV, P(profit) properly
-    distributed (no exact-0/1 collapse). Exit criterion met.
+    distributed. Exit criterion met.
 
 **Not built yet:**
-- Lean backtester (Phase 6) — **next**
+- **`MIN_NET_CREDIT` hard gate (Section M.2) — new, concrete, near-term task.**
+- Lean backtester (Phase 6), now incorporating Section M.5's four named scenarios
 - Paper trading (Phase 7)
-- Execution engine + risk/kill switch (Phase 8/9)
+- Execution engine + risk/kill switch (Phase 8/9) — exit trigger design now confirmed (Section M.3)
 - Dashboard/alerting (deferred)
-- Standalone continuous "opportunity scanner" (folded into `pricing/run_pricing.py` for the lean plan)
-- Slippage modeling in `pricing/ev_engine.py` (Section D.2/D.4 gap, disclosed via `model_notes`,
-  should be addressed before or during Phase 6 given how small the raw EV numbers are)
+- Slippage modeling in `pricing/ev_engine.py`
 
-**Outstanding items, deprioritized under the fast-track plan:**
-1. CoinSwitch options API docs.
-2. Shark Exchange (dropped from scope).
-3. Clarification on "CORP".
+**Outstanding items, sharpened but still unresolved (Section M.4):**
+1. CoinSwitch options API docs — now with specific claims to check: 1:30 PM IST settlement,
+   settlement price formula, live contract-multiplier ratio.
+2. Same for Shark Exchange, if it stays in scope.
+3. Clarification on "CORP" (unrelated to this update, still open).
