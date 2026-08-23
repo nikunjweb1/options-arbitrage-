@@ -1,1 +1,200 @@
-PLACEHOLDER_WILL_REPLACE
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Options Arbitrage — Research Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #121820; --border: #232b36; --text: #e6edf3;
+    --muted: #8b98a5; --green: #3fb950; --red: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .banner {
+    background: #3d2b12; border: 1px solid #7a5218; color: #f0b849;
+    padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 20px;
+  }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 24px; font-weight: 600; margin-top: 4px; }
+  .card .value.green { color: var(--green); }
+  .card .value.red { color: var(--red); }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .hist { display: flex; align-items: flex-end; gap: 4px; height: 80px; }
+  .hist .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; position: relative; }
+  .hist .bar span { position: absolute; bottom: -18px; left: 0; right: 0; text-align: center; font-size: 10px; color: var(--muted); }
+
+  .controls { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .controls select, .controls input {
+    background: #0d1319; border: 1px solid var(--border); color: var(--text);
+    padding: 6px 10px; border-radius: 6px; font-size: 13px;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+  tr:hover td { background: #161d26; }
+  .num-pos { color: var(--green); }
+  .num-neg { color: var(--red); }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .pill.yes { background: #0f3d1a; color: var(--green); }
+  .pill.no { background: #3d0f0f; color: var(--red); }
+
+  #status { color: var(--muted); font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<h1>Options Arbitrage — Research Dashboard</h1>
+<div class="subtitle">Read-only view of <code>signals</code> / <code>candidate_pairs</code>. No write endpoints. No trading.</div>
+
+<div id="offlineBanner" class="banner" style="display:none;"></div>
+
+<div class="cards" id="summaryCards"></div>
+
+<div class="panel">
+  <h2>P(profit) distribution</h2>
+  <div class="hist" id="histogram"></div>
+</div>
+
+<div class="panel">
+  <h2>Signals</h2>
+  <div class="controls">
+    <select id="filterEligible">
+      <option value="">All candidates</option>
+      <option value="true">Entry-eligible only (net credit)</option>
+      <option value="false">Net-debit only (excluded from live view)</option>
+    </select>
+    <select id="orderBy">
+      <option value="score">Sort: score</option>
+      <option value="expected_value">Sort: expected value</option>
+      <option value="prob_of_profit">Sort: P(profit)</option>
+      <option value="ts">Sort: most recent</option>
+    </select>
+    <input id="minProb" type="number" min="0" max="1" step="0.05" placeholder="min P(profit)">
+  </div>
+  <table id="signalsTable">
+    <thead>
+      <tr>
+        <th>Score</th><th>EV</th><th>P(profit)</th><th>Net Credit</th>
+        <th>Eligible</th><th>Classification</th>
+        <th>Short leg</th><th>Long leg</th><th>Priced at</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div id="status"></div>
+
+<script>
+const API_BASE = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+  ? "http://localhost:8000"
+  : ""; // same-origin if deployed behind a reverse proxy
+
+async function fetchJSON(path) {
+  const res = await fetch(API_BASE + path);
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+function fmt(n, digits = 2) {
+  if (n === null || n === undefined) return "—";
+  return Number(n).toFixed(digits);
+}
+
+function pnlClass(n) {
+  if (n === null || n === undefined) return "";
+  return n > 0 ? "num-pos" : (n < 0 ? "num-neg" : "");
+}
+
+async function loadSummary() {
+  const s = await fetchJSON("/api/summary");
+  const cards = [
+    { label: "Total signals", value: s.total_signals ?? "—" },
+    { label: "Entry-eligible (net credit)", value: `${s.entry_eligible_count ?? "—"} (${s.entry_eligible_pct ?? "—"}%)`, cls: "green" },
+    { label: "Positive EV", value: `${s.positive_ev_count ?? "—"} (${s.positive_ev_pct ?? "—"}%)`, cls: "green" },
+    { label: "Latest run", value: s.latest_ts ? new Date(s.latest_ts).toLocaleString() : "—" },
+  ];
+  document.getElementById("summaryCards").innerHTML = cards.map(c => `
+    <div class="card">
+      <div class="label">${c.label}</div>
+      <div class="value ${c.cls || ""}">${c.value}</div>
+    </div>
+  `).join("");
+
+  const maxBucket = Math.max(1, ...s.prob_of_profit_histogram);
+  document.getElementById("histogram").innerHTML = s.prob_of_profit_histogram.map((count, i) => `
+    <div class="bar" style="height:${(count / maxBucket) * 100}%" title="${count} signals">
+      <span>${(i / 10).toFixed(1)}</span>
+    </div>
+  `).join("");
+}
+
+async function loadSignals() {
+  const eligible = document.getElementById("filterEligible").value;
+  const orderBy = document.getElementById("orderBy").value;
+  const minProb = document.getElementById("minProb").value;
+
+  const params = new URLSearchParams({ order_by: orderBy, limit: "200" });
+  if (eligible) params.set("entry_eligible", eligible);
+  if (minProb) params.set("min_prob_of_profit", minProb);
+
+  const data = await fetchJSON("/api/signals?" + params.toString());
+  const tbody = document.querySelector("#signalsTable tbody");
+  tbody.innerHTML = data.results.map(r => `
+    <tr>
+      <td>${fmt(r.score, 3)}</td>
+      <td class="${pnlClass(r.expected_value)}">${fmt(r.expected_value)}</td>
+      <td>${r.prob_of_profit !== null ? fmt(r.prob_of_profit * 100, 1) + "%" : "—"}</td>
+      <td class="${pnlClass(r.net_entry_cost)}">${fmt(r.net_entry_cost)}</td>
+      <td><span class="pill ${r.entry_eligible ? "yes" : "no"}">${r.entry_eligible ? "credit" : "debit"}</span></td>
+      <td>${r.classification || "—"}</td>
+      <td>${r.short_exchange || "?"} ${r.short_strike !== null ? fmt(r.short_strike, 0) : ""} ${r.short_option_type || ""}</td>
+      <td>${r.long_exchange || "?"} ${r.long_strike !== null ? fmt(r.long_strike, 0) : ""}</td>
+      <td>${r.ts ? new Date(r.ts).toLocaleString() : "—"}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="9" style="color:var(--muted)">No signals match this filter.</td></tr>`;
+}
+
+async function refreshAll() {
+  const banner = document.getElementById("offlineBanner");
+  const status = document.getElementById("status");
+  try {
+    await loadSummary();
+    await loadSignals();
+    banner.style.display = "none";
+    status.textContent = "Last refreshed " + new Date().toLocaleTimeString();
+  } catch (err) {
+    banner.style.display = "block";
+    banner.textContent = "⚠ Could not reach the dashboard API: " + err.message +
+      " — make sure the backend is running (see dashboard/README.md) and pointed at a real SQLite DB.";
+    status.textContent = "";
+  }
+}
+
+document.getElementById("filterEligible").addEventListener("change", loadSignals);
+document.getElementById("orderBy").addEventListener("change", loadSignals);
+document.getElementById("minProb").addEventListener("input", () => {
+  clearTimeout(window._debounce);
+  window._debounce = setTimeout(loadSignals, 300);
+});
+
+refreshAll();
+setInterval(refreshAll, 30000); // auto-refresh every 30s
+</script>
+
+</body>
+</html>
