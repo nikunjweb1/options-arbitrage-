@@ -9,25 +9,53 @@ the reasoning -- the same host-refusal rule is duplicated here rather than
 imported, so this file's safety property doesn't depend on another file
 staying correct.
 
-HONESTY NOTE -- READ BEFORE USING THIS IN PRODUCTION:
-Unlike delta_ws.py (whose channel name and message shape were corrected
-against a real live testnet connection -- see that file's docstring), the
-event names and payload shapes below are NOT YET CONFIRMED against a real
-Shark connection. As of this writing, exchange_adapters/shark_ws_capture.py
-has only been verified to reach the Engine.IO handshake (HTTP 200 on
-/socket.io/?EIO=4&transport=polling); no actual ticker/orderbook payload has
-been captured yet.
+STATUS UPDATE (2026-08-23): _parse_ticker / _parse_depth / _parse_index are
+no longer stubs. Real payloads were captured via browser DevTools (Network ->
+WS -> Messages) against a live connection to
+`fawss-options.sharkexchange.in` and inspected directly -- not guessed, not
+assumed-by-analogy from Delta's field names, per this project's own rule
+(see architecture.md Section C, ev_engine.py Bug #2).
 
-So, per this project's own established rule (ev_engine.py Bug #2,
-delta_ws.py's channel correction -- every real bug here was found by looking
-at real data, never guessed): the parsing methods below (_parse_ticker,
-_parse_depth) are STUBS. They raise NotImplementedError with a pointer back
-to this docstring, on purpose, rather than silently returning made-up
-field mappings that look plausible but were never checked. Fill them in only
-after running shark_ws_capture.py against the real host and inspecting a
-real captured payload -- then delete this paragraph and replace it with the
-same kind of "confirmed against live connection on <date>" note delta_ws.py
-has.
+CONFIRMED from real captured frames:
+  - Engine.IO v4 framing: "42" prefix + JSON array [event_name, payload],
+    e.g. `42["ticker",{...}]`. Bare "2"/"3" and "2probe"/"3probe" frames are
+    Engine.IO ping/pong and upgrade-probe control frames, not app events --
+    correctly ignored by python-socketio itself, never reach this file's
+    handlers.
+  - "ticker" event payload confirmed fields: symbol, bidPrice, bidSize,
+    bidIv, askPrice, askSize, askIv, lastPrice, highPrice24h, lowPrice24h.
+  - "orderBook" event payload confirmed fields: bids (list of [price, size]
+    string pairs). An "asks" array is almost certainly present (mirrors
+    "bids") but was cut off in every captured frame before it could be
+    read -- see OPEN ITEM below.
+  - "indexPrice" event payload confirmed fields (small enough to capture in
+    full): indexPrice, baseCoin, quoteCoin.
+
+OPEN ITEM, NOT YET CONFIRMED -- do not assume these exist or use these names:
+  - Every captured "ticker" and "orderBook" frame was truncated (DevTools
+    row preview, not the full JSON) after the fields listed above. There is
+    almost certainly more in the real payload -- e.g. volume/open-interest
+    fields on ticker, an "asks" array on orderBook, and possibly a
+    timestamp. Until a full, untruncated frame is captured (click the row in
+    DevTools -> Payload/Preview shows the full JSON, or add
+    `--dump-full-json` handling to shark_ws_capture.py), this parser reads
+    only the fields confirmed above and leaves the rest unmapped rather than
+    guessing. `_RAW_UNPARSED_KEYS_SEEN` below is populated at runtime so you
+    can log/inspect exactly what additional keys show up once real traffic
+    flows, without having to re-open DevTools.
+  - No timestamp field was observed in any captured frame. Until confirmed
+    otherwise, MarketSnapshot.timestamp is stamped with ingestion time
+    (datetime.now(timezone.utc)), same fallback delta_ws.py uses when a
+    feed doesn't provide its own timestamp -- NOT a claim that this is the
+    exchange's own event time.
+  - Whether an explicit subscribe event is required (and its shape) is
+    STILL unconfirmed -- _send_subscribe below remains a stub. The captured
+    ticker/orderBook/indexPrice frames arrived without this file ever having
+    sent a subscribe message, which suggests the public feed may just push
+    a default symbol set unsolicited -- but that's an observation, not a
+    confirmed protocol fact, until checked deliberately (e.g. via
+    shark_ws_capture.py --subscribe-event against a *different* symbol than
+    whatever loads by default on the page).
 
 Protocol note (independently verifiable, not a guess): the captured URLs
 (https://fawss-options.sharkexchange.in/socket.io/...) are Engine.IO v4 /
@@ -36,24 +64,17 @@ This client uses python-socketio's Client for the same reason that capture
 script does -- it handles the Engine.IO handshake and sid negotiation
 correctly on its own; nothing here hardcodes or reuses a captured sid.
 
-What IS reused safely from shark_ws_capture.py's findings: the "uds" host
-exclusion rule, and the base library choice (python-socketio). What is NOT
-reused: any specific event name or payload shape, because none has been
-observed yet.
-
 Design (mirrors delta_ws.py's public API on purpose, so the two adapters
 are interchangeable from the caller's point of view):
   - Runs the socketio client in a background thread.
   - subscribe(symbols) / start() / stop() / wait_until_connected() -- same
     signatures as DeltaWebSocketClient.
   - Reconnects with backoff; python-socketio has its own built-in
-    reconnection, configured here rather than hand-rolled, since re-deriving
-    Engine.IO's reconnect/backoff semantics by hand would be exactly the
-    kind of untested guesswork this file is trying to avoid elsewhere.
+    reconnection, configured here rather than hand-rolled.
   - Delivers parsed MarketSnapshot objects to a caller-supplied callback,
     same as delta_ws.py -- this file does not know about SQLite.
 
-Usage once the parser stubs are filled in:
+Usage:
     pip install "python-socketio[client]" --break-system-packages
 """
 
@@ -75,6 +96,16 @@ MarketSnapshotCallback = Callable[[MarketSnapshot], None]
 # shark_ws_capture.py deliberately -- see module docstring.
 _ALLOWED_HOST_SUBSTRINGS_MUST_NOT_CONTAIN = "uds"
 
+# Fields confirmed present on a real captured "ticker" frame (see module
+# docstring). Anything else that shows up is logged, not silently dropped,
+# via _RAW_UNPARSED_KEYS_SEEN.
+_CONFIRMED_TICKER_FIELDS = {
+    "symbol", "bidPrice", "bidSize", "bidIv", "askPrice", "askSize",
+    "askIv", "lastPrice", "highPrice24h", "lowPrice24h",
+}
+_CONFIRMED_ORDERBOOK_FIELDS = {"bids", "asks"}
+_CONFIRMED_INDEXPRICE_FIELDS = {"indexPrice", "baseCoin", "quoteCoin"}
+
 
 def _refuse_if_uds(host: str) -> None:
     if _ALLOWED_HOST_SUBSTRINGS_MUST_NOT_CONTAIN in host.lower():
@@ -90,13 +121,11 @@ class SharkWebSocketClient:
     """
     Public-data-only WebSocket client for Shark Exchange.
 
-    NOT YET FUNCTIONAL END-TO-END: connects successfully (Engine.IO
-    handshake only, confirmed manually via browser DevTools so far -- see
-    module docstring), but _parse_ticker/_parse_depth are stubs until a real
-    payload has been captured and inspected. Wiring this into
-    collectors/realtime_collector.py before then would silently produce no
-    data (or worse, mis-parsed data) rather than a clear, actionable error --
-    so the stubs raise loudly instead.
+    Ticker, orderBook (bids side), and indexPrice events are parsed against
+    real captured payloads (see module docstring). The orderBook "asks" side
+    and any fields beyond what's listed in _CONFIRMED_*_FIELDS are NOT yet
+    confirmed -- see OPEN ITEM in the module docstring before trusting this
+    for anything beyond the confirmed fields.
     """
 
     def __init__(
@@ -118,9 +147,14 @@ class SharkWebSocketClient:
         self._symbols: set[str] = set()
         self._symbols_lock = threading.Lock()
 
-        self._sio = None  # socketio.Client, created lazily in start() so
-        # importing this module doesn't require python-socketio to be
-        # installed unless it's actually used.
+        # Populated at runtime with any JSON keys seen on ticker/orderBook/
+        # indexPrice frames that are NOT in the confirmed field sets above.
+        # Inspect this (e.g. from a REPL or a debug log line) to find out
+        # what the truncated DevTools captures were hiding, without having
+        # to go back to the browser.
+        self._raw_unparsed_keys_seen: set[str] = set()
+
+        self._sio = None  # socketio.Client, created lazily in start()
         self._thread: threading.Thread | None = None
         self._should_run = False
         self._connected_event = threading.Event()
@@ -162,19 +196,15 @@ class SharkWebSocketClient:
 
     def subscribe(self, symbols: list[str]) -> None:
         """
-        Adds symbols to the tracked set and, if already connected, attempts
-        to (re-)subscribe. NOTE: whether an explicit subscribe event is even
-        required, and what its name/payload should be, is UNCONFIRMED -- see
-        module docstring and shark_ws_capture.py's --subscribe-event flag,
-        which exists specifically to find this out. _send_subscribe below is
-        a stub for the same reason _parse_ticker/_parse_depth are.
+        Adds symbols to the tracked set. NOTE: real captured traffic arrived
+        WITHOUT this client ever sending a subscribe message (see module
+        docstring OPEN ITEM) -- so for now this only tracks symbols for
+        filtering in _on_message; it does not attempt to send an unconfirmed
+        subscribe frame. If/when a real subscribe event name is confirmed
+        via shark_ws_capture.py, wire it in here and in _send_subscribe.
         """
         with self._symbols_lock:
-            new_symbols = [s for s in symbols if s not in self._symbols]
             self._symbols.update(symbols)
-
-        if new_symbols and self._connected_event.is_set():
-            self._send_subscribe(new_symbols)
 
     def wait_until_connected(self, timeout_sec: float = 15.0) -> bool:
         return self._connected_event.wait(timeout=timeout_sec)
@@ -197,10 +227,6 @@ class SharkWebSocketClient:
         def connect():
             logger.info("Shark WebSocket connected to %s", self._host)
             self._connected_event.set()
-            with self._symbols_lock:
-                symbols = list(self._symbols)
-            if symbols:
-                self._send_subscribe(symbols)
 
         @sio.event
         def connect_error(data):
@@ -212,35 +238,43 @@ class SharkWebSocketClient:
             logger.warning("Shark WebSocket disconnected.")
             self._connected_event.clear()
 
-        # Catch-all so nothing is silently dropped before the real event
-        # names are known -- once _parse_ticker/_parse_depth are filled in,
-        # this should be replaced with explicit @sio.on("<real_event_name>")
-        # handlers, matching delta_ws.py's explicit "v2/ticker" type filter
-        # rather than a catch-all.
+        @sio.on("ticker")
+        def on_ticker(data):
+            self._dispatch("ticker", data, self._parse_ticker)
+
+        @sio.on("orderBook")
+        def on_orderbook(data):
+            self._dispatch("orderBook", data, self._parse_depth)
+
+        @sio.on("indexPrice")
+        def on_index_price(data):
+            self._dispatch("indexPrice", data, self._parse_index)
+
+        # Anything outside the three confirmed event names above still
+        # arrives here so nothing is silently dropped while more of the
+        # protocol gets confirmed.
         @sio.on("*")
         def catch_all(event, data=None):
-            self._on_message(event, data)
+            if event not in ("ticker", "orderBook", "indexPrice"):
+                logger.debug("Unhandled Shark WS event %r: %s", event, str(data)[:300])
+
+    def _dispatch(self, event_name: str, data, parser) -> None:
+        try:
+            snapshot = parser(data)
+        except Exception:  # noqa: BLE001 -- fail closed: log, don't crash the socket thread
+            logger.exception("Failed to parse Shark %r payload: %s", event_name, str(data)[:300])
+            return
+        if snapshot is not None:
+            self._on_snapshot(snapshot)
 
     def _send_subscribe(self, symbols: list[str]) -> None:
         raise NotImplementedError(
-            "Subscribe message shape is unconfirmed for Shark's public feed. "
-            "Run exchange_adapters/shark_ws_capture.py against the real host "
-            "first (with and without --subscribe-event) to find out whether "
-            "a subscribe step is even required, and what it looks like if so. "
-            "See this file's module docstring."
+            "Subscribe message shape is unconfirmed for Shark's public feed -- "
+            "real traffic was observed without ever sending one. See module "
+            "docstring OPEN ITEM before implementing this."
         )
 
-    # -- internal: message parsing (STUBS -- see module docstring) ----------
-
-    def _on_message(self, event: str, data: dict | list | None) -> None:
-        logger.debug("Shark WS event %r: %s", event, str(data)[:300])
-        # Once real event names are known, dispatch here, e.g.:
-        #   if event == "<real_ticker_event_name>":
-        #       snapshot = self._parse_ticker(data)
-        #       if snapshot is not None:
-        #           self._on_snapshot(snapshot)
-        # Left as a no-op dispatcher until shark_ws_capture.py output confirms
-        # what event names actually arrive.
+    # -- internal: message parsing -------------------------------------------
 
     @staticmethod
     def _dec_or_none(v) -> Decimal | None:
@@ -251,24 +285,121 @@ class SharkWebSocketClient:
         except (InvalidOperation, ValueError):
             return None
 
+    def _track_unparsed_keys(self, data: dict, confirmed: set[str]) -> None:
+        extra = set(data.keys()) - confirmed
+        if extra and not extra.issubset(self._raw_unparsed_keys_seen):
+            self._raw_unparsed_keys_seen |= extra
+            logger.info(
+                "Shark WS: new unmapped field(s) seen, not yet parsed: %s "
+                "(add these to shark_ws.py once you know what they mean)",
+                sorted(extra),
+            )
+
     def _parse_ticker(self, data: dict) -> MarketSnapshot | None:
         """
-        STUB. Do not fill this in from guesswork or from Delta's field names
-        assumed-by-analogy -- Shark's REST docs (docs.sharkexchange.in) show
-        a completely different JSON shape for order/position objects than
-        Delta uses (e.g. "orderAmount" vs Delta's quantity fields, "symbol"
-        strings like "BTCUSDT"/"BTCINR" rather than Delta's product_id
-        integers), so there's no reason to assume the WS ticker shape
-        transfers either. Fill in from a real captured payload only.
+        Confirmed against a real captured frame (see module docstring). Only
+        maps fields in _CONFIRMED_TICKER_FIELDS -- anything else present in
+        `data` is logged via _track_unparsed_keys, not guessed at.
         """
-        raise NotImplementedError(
-            "Shark ticker payload shape not yet observed. Capture real data "
-            "with shark_ws_capture.py first. See this file's module docstring."
+        if not isinstance(data, dict) or "symbol" not in data:
+            return None
+        self._track_unparsed_keys(data, _CONFIRMED_TICKER_FIELDS)
+
+        symbol = data["symbol"]
+        with self._symbols_lock:
+            tracked = self._symbols
+        if tracked and symbol not in tracked:
+            return None  # filtered client-side until a real subscribe exists
+
+        best_bid = self._dec_or_none(data.get("bidPrice"))
+        best_ask = self._dec_or_none(data.get("askPrice"))
+        bid_size = self._dec_or_none(data.get("bidSize"))
+        ask_size = self._dec_or_none(data.get("askSize"))
+
+        # A 0/0 bid is a real, meaningful "no bid" state on this feed (see
+        # the captured 86000-C frame: bidPrice "0", bidSize "0") -- keep it
+        # as Decimal("0"), not None, so is_executable() correctly reports
+        # False rather than looking like a missing-field parse failure.
+        return MarketSnapshot(
+            timestamp=datetime.now(timezone.utc),
+            exchange="shark",
+            instrument_id=symbol,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            last_price=self._dec_or_none(data.get("lastPrice")),
+            # highPrice24h/lowPrice24h are confirmed fields but MarketSnapshot
+            # has no dedicated slot for them -- not forced into an unrelated
+            # field (e.g. mark_price) just to use them. Add a real field to
+            # MarketSnapshot if these turn out to matter downstream.
+            iv=self._dec_or_none(data.get("askIv") or data.get("bidIv")),
         )
 
     def _parse_depth(self, data: dict) -> MarketSnapshot | None:
-        """STUB -- same reasoning as _parse_ticker."""
-        raise NotImplementedError(
-            "Shark depth/orderbook payload shape not yet observed. Capture "
-            "real data with shark_ws_capture.py first."
+        """
+        Confirmed for the "bids" side only (see module docstring OPEN ITEM --
+        "asks" was never observed in an untruncated capture). Returns a
+        MarketSnapshot with book_levels populated from bids; best_ask/ask_size
+        are left None until "asks" is confirmed, which means is_executable()
+        will correctly report False for depth-only snapshots -- by design,
+        not an oversight, per architecture.md's fail-closed / executable-
+        price-only rule (Section A.1). Do not patch this to fabricate an ask
+        side.
+        """
+        if not isinstance(data, dict) or "bids" not in data:
+            return None
+        self._track_unparsed_keys(data, _CONFIRMED_ORDERBOOK_FIELDS)
+
+        bids_raw = data.get("bids") or []
+        book_levels: list[tuple[Decimal, Decimal]] = []
+        for level in bids_raw:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                continue
+            price = self._dec_or_none(level[0])
+            size = self._dec_or_none(level[1])
+            if price is not None and size is not None:
+                book_levels.append((price, size))
+
+        if not book_levels:
+            return None
+
+        best_bid_price, best_bid_size = book_levels[0]
+
+        # No instrument_id is present on captured orderBook frames -- unlike
+        # "ticker", which carries "symbol". Until confirmed otherwise, this
+        # snapshot cannot be safely attributed to a specific instrument, so
+        # instrument_id is left as an explicit placeholder rather than
+        # guessed from whatever ticker was last seen (that coupling would be
+        # a silent correctness bug if orderBook and ticker frames for
+        # different symbols interleave). Fix this once a real frame confirms
+        # whether orderBook carries its own symbol field.
+        return MarketSnapshot(
+            timestamp=datetime.now(timezone.utc),
+            exchange="shark",
+            instrument_id="UNKNOWN_ORDERBOOK_SYMBOL",  # see docstring above
+            best_bid=best_bid_price,
+            best_ask=None,
+            bid_size=best_bid_size,
+            ask_size=None,
+            book_levels=book_levels,
+        )
+
+    def _parse_index(self, data: dict) -> MarketSnapshot | None:
+        """Confirmed against a real, fully-captured "indexPrice" frame."""
+        if not isinstance(data, dict) or "indexPrice" not in data:
+            return None
+        self._track_unparsed_keys(data, _CONFIRMED_INDEXPRICE_FIELDS)
+
+        base = data.get("baseCoin", "")
+        quote = data.get("quoteCoin", "")
+        return MarketSnapshot(
+            timestamp=datetime.now(timezone.utc),
+            exchange="shark",
+            instrument_id=f"{base}-{quote}-INDEX",
+            best_bid=None,
+            best_ask=None,
+            bid_size=None,
+            ask_size=None,
+            index_price=self._dec_or_none(data.get("indexPrice")),
         )
