@@ -104,6 +104,17 @@ class RiskLimits:
     min_liquidity: float = float(os.getenv("MIN_LIQUIDITY", "0"))
     min_expected_profit: float = float(os.getenv("MIN_EXPECTED_PROFIT", "0"))
 
+    # Per docs/architecture.md Section M.2: a candidate whose net_entry_cost
+    # is not a real net CREDIT (net_entry_cost > min_net_credit) is not just
+    # lower-ranked -- it's a hard DO_NOT_ENTER. The video's own worked
+    # examples (Section M.2) show a net-debit entry loses the full debit in
+    # a high-momentum scenario, with no path to doing better than net-credit
+    # in that tail; this checks out from the existing P&L math (Section
+    # D.2/D.4), it just wasn't previously enforced as a gate. Default 0.0
+    # means "any positive net credit clears the bar"; raise via
+    # MIN_NET_CREDIT env var for a safety margin above zero.
+    min_net_credit: float = float(os.getenv("MIN_NET_CREDIT", "0.0"))
+
 
 @dataclass(frozen=True)
 class DBConfig:

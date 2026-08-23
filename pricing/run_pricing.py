@@ -10,10 +10,9 @@ Per docs/architecture.md Section L.2 / Phase 5 exit criterion:
 
 This is what actually connects Phase 3's candidate_pairs to
 pricing/ev_engine.py -- ev_engine.py and black_scholes.py are pure functions
-(now tested against fixtures in tests/test_ev_engine.py); this script is
-what proves the whole thing works against live Delta testnet quotes, the
-same way matching/run_matcher.py proved the matcher against real Phase 2
-data.
+(tested against fixtures in tests/test_ev_engine.py); this script is what
+proves the whole thing works against live Delta testnet quotes, the same
+way matching/run_matcher.py proved the matcher against real Phase 2 data.
 
 IMPORTANT -- what "ranked"/"scored" means here: the architecture diagram
 (Section A.2) has an OPPORTUNITY SCANNER stage between the EV engine and the
@@ -46,23 +45,24 @@ especially for same_exchange_calendar_spread candidates with short-dated
 D1 short legs -- the gap between match time and price time is itself a
 source of data loss, not just a cosmetic delay.
 
-DIAGNOSTIC FIELDS ADDED (2026-08-22): after the contract_multiplier fix,
-the second live run (699 usable candidates) still showed a hard, exact
-100%/0% split on probability_of_profit for every printed result -- nothing
-in between. That's not necessarily wrong (see ev_engine.py's own note on
-why (v_long - short_payoff) is structurally >= 0 for exact-strike calendar
-spreads), but it's also consistent with a different, more mundane gap: for
-candidates whose short leg expires within hours (not days), sigma_move
-(the fractional 1-standard-deviation price move the scenario grid explores)
-can be tiny -- e.g. ~1.2% for a 3-hour-to-expiry leg at 65% IV -- so even
-the +/-2 sigma grid points barely move the price, and the grid can't
-discover a losing scenario even where one might exist at a coarser but more
-realistic move size. EVResult now carries time_to_short_expiry_hours,
-sigma_move, and base_iv_used so this printout can show, for each ranked
-result, whether "guaranteed profit" is backed by a real price range or by
-an accidentally too-narrow one. This is a visibility fix, not a pricing
-fix -- it doesn't change any EV/probability number, it just surfaces the
-inputs that produced it.
+DIAGNOSTIC FIELDS ADDED (2026-08-22): every ranked print line includes
+time_to_short_expiry_hours, sigma_move, and base_iv_used so a P(profit) of
+exactly 1.0 or 0.0 can be explained rather than just reported -- whether
+"guaranteed profit" is backed by a real price range or an accidentally too-
+narrow one. This is a visibility fix, not a pricing fix.
+
+MIN_NET_CREDIT GATE ADDED (2026-08-23, per docs/architecture.md Section
+M.2): a candidate whose net_entry_cost is not a real net credit
+(net_entry_cost > RISK.min_net_credit, default 0.0) is now a hard
+DO_NOT_ENTER, not just a lower-ranked candidate. Every priced candidate is
+still evaluated and persisted (never silently dropped), tagged with a real
+`entry_eligible` column in `signals` -- but the ranked "Top N" / "Bottom N"
+opportunity display now only shows entry_eligible candidates, since a
+net-debit calendar spread has no scenario in this payoff structure where it
+outperforms a net-credit one in the tail (Section M.2's worked-example
+argument), so surfacing it as a ranked "opportunity" is actively misleading
+even when its EV happens to look positive under the lean model's
+simplifications.
 
 Usage:
     python -m pricing.run_pricing --underlying BTC
@@ -86,7 +86,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from config.settings import COLLECTOR, DB
+from config.settings import COLLECTOR, DB, RISK
 from exchange_adapters.delta import DeltaAdapter, DeltaAdapterError
 from matching.schemas import Classification, MatchCandidate
 from normalization.schemas import (
@@ -110,6 +110,38 @@ logger = logging.getLogger("pricing.run_pricing")
 _ADAPTERS = {
     "delta_india": DeltaAdapter(),
 }
+
+
+def _ensure_entry_eligible_column(conn: sqlite3.Connection) -> None:
+    """
+    Idempotent migration for `signals.entry_eligible` (Section M.2), for
+    databases created before this column existed in db/schema.sql.
+    ALTER TABLE ... ADD COLUMN has no "IF NOT EXISTS" guard in the SQL
+    dialect itself pre-3.35, so this catches sqlite3's specific
+    "duplicate column name" error rather than trying to pre-detect it via
+    PRAGMA table_info, which would be one more thing to keep in sync with
+    the column name below.
+    """
+    try:
+        conn.execute(
+            "ALTER TABLE signals ADD COLUMN entry_eligible INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (entry_eligible IN (0, 1))"
+        )
+        conn.commit()
+        logger.info("Migrated existing `signals` table: added entry_eligible column (Section M.2).")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
+def is_entry_eligible(net_entry_cost: Decimal, min_net_credit: Decimal) -> bool:
+    """
+    Per docs/architecture.md Section M.2: a real net CREDIT is a hard gate,
+    not a ranking preference. Pulled out as its own function so the gate
+    logic itself -- not just its wiring into the CLI -- has a direct unit
+    test (tests/test_run_pricing.py).
+    """
+    return net_entry_cost > min_net_credit
 
 
 def _row_to_contract(row: sqlite3.Row) -> OptionContract | None:
@@ -268,7 +300,7 @@ def _fetch_snapshot(
     return snapshot
 
 
-def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
+def _persist_results(conn: sqlite3.Connection, results: list[EVResult], eligibility: dict[str, bool]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     rows = []
     for r in results:
@@ -288,6 +320,7 @@ def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
             "time_to_short_expiry_hours": r.time_to_short_expiry_hours,
             "sigma_move": r.sigma_move,
             "base_iv_used": r.base_iv_used,
+            "entry_eligible": eligibility.get(r.pair_id, False),
             "model_notes": list(r.model_notes),
         }
         rows.append((
@@ -295,31 +328,34 @@ def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
             str(r.net_entry_cost), str(r.expected_value), str(r.expected_value),
             str(r.probability_of_profit), None, None, None,
             str(score), json.dumps(breakdown),
+            1 if eligibility.get(r.pair_id, False) else 0,
         ))
     conn.executemany(
         """
         INSERT INTO signals (
             signal_id, ts, pair_id, net_entry_cost, expected_value, expected_profit,
-            prob_of_profit, var_95, expected_shortfall, required_margin, score, score_breakdown
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            prob_of_profit, var_95, expected_shortfall, required_margin, score, score_breakdown,
+            entry_eligible
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
     conn.commit()
 
 
-def _log_result_line(r: EVResult) -> None:
+def _log_result_line(r: EVResult, eligible: bool) -> None:
     """
     One ranked-result log line, including the diagnostic fields
-    (time_to_short_expiry_hours, sigma_move, base_iv_used) added 2026-08-22
-    so a P(profit) of exactly 1.0 or 0.0 can be explained rather than just
-    reported. See module docstring's DIAGNOSTIC FIELDS ADDED note.
+    (time_to_short_expiry_hours, sigma_move, base_iv_used) so a P(profit) of
+    exactly 1.0 or 0.0 can be explained rather than just reported, and the
+    Section M.2 eligibility tag so it's visible even when scanning raw logs
+    rather than querying `signals` directly.
     """
     logger.info(
         "  EV=%s  P(profit)=%s  net_entry=%s  fees=%s  "
-        "hrs_to_short_expiry=%.2f  sigma_move=%.4f  iv_used=%.4f  %s",
+        "hrs_to_short_expiry=%.2f  sigma_move=%.4f  iv_used=%.4f  entry_eligible=%s  %s",
         r.expected_value, r.probability_of_profit, r.net_entry_cost, r.fees_total,
-        r.time_to_short_expiry_hours, r.sigma_move, r.base_iv_used, r.pair_id,
+        r.time_to_short_expiry_hours, r.sigma_move, r.base_iv_used, eligible, r.pair_id,
     )
 
 
@@ -335,13 +371,11 @@ def main() -> int:
                          help="Filter to one Classification value, e.g. same_exchange_calendar_spread")
     parser.add_argument("--limit", type=int, default=None,
                          help="Price at most N candidates -- useful for a smoke test before a full 1,504-pair run.")
-    parser.add_argument("--top", type=int, default=20, help="How many top-EV results to print.")
+    parser.add_argument("--top", type=int, default=20, help="How many top-EV entry_eligible results to print.")
     parser.add_argument("--bottom", type=int, default=None,
-                         help="How many lowest-EV results to also print, with the same diagnostic fields as "
-                              "--top. Defaults to the same value as --top. Printed separately from --top so "
-                              "both tails of the distribution are always visible, even in datasets (like the "
-                              "699-candidate run on 2026-08-22) where the number of positive-EV results is "
-                              "smaller than --top and the negative tail would otherwise get crowded out.")
+                         help="How many lowest-EV entry_eligible results to also print, with the same diagnostic "
+                              "fields as --top. Defaults to the same value as --top. Printed separately from --top "
+                              "so both tails of the eligible distribution are always visible.")
     parser.add_argument("--dry-run", action="store_true", help="Print results without writing to `signals`.")
     args = parser.parse_args()
     bottom_n = args.bottom if args.bottom is not None else args.top
@@ -352,6 +386,11 @@ def main() -> int:
 
     conn = sqlite3.connect(DB.sqlite_path)
     conn.execute("PRAGMA foreign_keys = ON;")
+    _ensure_entry_eligible_column(conn)
+
+    min_net_credit = Decimal(str(RISK.min_net_credit))
+    logger.info("MIN_NET_CREDIT gate active: net_entry_cost must be > %s to be entry_eligible (Section M.2).",
+                min_net_credit)
 
     candidates, skipped_expired = _load_candidates(
         conn, args.underlying, Decimal(str(args.min_confidence)), args.classification, args.limit
@@ -430,38 +469,58 @@ def main() -> int:
         if i % 100 == 0:
             logger.info("  ...%d/%d processed", i, len(candidates))
 
+    # Section M.2 gate: computed for every priced result, never skipped.
+    eligibility: dict[str, bool] = {
+        r.pair_id: is_entry_eligible(r.net_entry_cost, min_net_credit) for r in results
+    }
+    eligible_results = [r for r in results if eligibility[r.pair_id]]
+    ineligible_count = len(results) - len(eligible_results)
+
     positive_ev = [r for r in results if r.expected_value > 0]
     logger.info(
         "Result: %d priced, %d skipped (already expired), %d skipped (no executable live data), "
-        "%d skipped (no fee schedule), %d of %d priced show positive EV.",
+        "%d skipped (no fee schedule), %d of %d priced show positive EV, "
+        "%d of %d priced are entry_eligible (net credit, Section M.2; %d are net-debit DO_NOT_ENTER).",
         len(results), skipped_expired, skipped_no_data, skipped_no_fees, len(positive_ev), len(results),
+        len(eligible_results), len(results), ineligible_count,
     )
 
-    ranked = sorted(results, key=lambda r: r.expected_value, reverse=True)
+    # Ranked display is entry_eligible-only, per Section M.2: a net-debit
+    # candidate is never shown as a ranked "opportunity", even if its EV
+    # happens to look positive under the lean model's simplifications --
+    # see module docstring for why. Every priced candidate (eligible or not)
+    # is still persisted below, so nothing is silently dropped from `signals`.
+    ranked = sorted(eligible_results, key=lambda r: r.expected_value, reverse=True)
 
-    logger.info("Top %d by EV (each line: EV, P(profit), net entry, fees, hours-to-short-expiry, "
-                "sigma_move, IV used, pair id) --", min(args.top, len(ranked)))
+    logger.info(
+        "Top %d entry_eligible by EV (each line: EV, P(profit), net entry, fees, hours-to-short-expiry, "
+        "sigma_move, IV used, eligibility, pair id) --", min(args.top, len(ranked)),
+    )
     for r in ranked[: args.top]:
-        _log_result_line(r)
+        _log_result_line(r, True)
 
     if bottom_n:
         bottom_slice = ranked[-bottom_n:] if bottom_n < len(ranked) else ranked
-        # Print ascending (worst first) so the most negative EV leads --
-        # mirrors how the top section leads with the highest EV.
-        logger.info("Bottom %d by EV, for comparison --", min(bottom_n, len(ranked)))
+        logger.info("Bottom %d entry_eligible by EV, for comparison --", min(bottom_n, len(ranked)))
         for r in sorted(bottom_slice, key=lambda r: r.expected_value):
-            _log_result_line(r)
+            _log_result_line(r, True)
+
+    if ineligible_count:
+        logger.info(
+            "%d priced candidate(s) were net-debit (entry_eligible=0, Section M.2 DO_NOT_ENTER) and are "
+            "excluded from the ranked display above -- still priced and persisted to `signals` for visibility, "
+            "just never surfaced as a ranked opportunity.",
+            ineligible_count,
+        )
 
     # Quick aggregate check on the P(profit) split itself: how many results
-    # land at exactly 1.0 or exactly 0.0 vs. somewhere in between. A large
-    # share at the exact extremes, concentrated among short hours-to-expiry
-    # candidates, points at the sigma_move resolution gap described in the
-    # module docstring rather than a real all-or-nothing market signal.
+    # land at exactly 1.0 or exactly 0.0 vs. somewhere in between.
     exact_one = sum(1 for r in results if r.probability_of_profit == Decimal("1"))
     exact_zero = sum(1 for r in results if r.probability_of_profit == Decimal("0"))
     if results:
         logger.info(
-            "P(profit) split: %d/%d exactly 1.0, %d/%d exactly 0.0, %d/%d strictly between 0 and 1.",
+            "P(profit) split (all priced, not just entry_eligible): %d/%d exactly 1.0, %d/%d exactly 0.0, "
+            "%d/%d strictly between 0 and 1.",
             exact_one, len(results), exact_zero, len(results),
             len(results) - exact_one - exact_zero, len(results),
         )
@@ -469,8 +528,9 @@ def main() -> int:
     if args.dry_run:
         logger.info("--dry-run: not writing to `signals`.")
     else:
-        _persist_results(conn, results)
-        logger.info("Wrote %d signal(s) to `signals`.", len(results))
+        _persist_results(conn, results, eligibility)
+        logger.info("Wrote %d signal(s) to `signals` (%d entry_eligible, %d net-debit).",
+                    len(results), len(eligible_results), ineligible_count)
 
     conn.close()
     return 0

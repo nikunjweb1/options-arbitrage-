@@ -89,10 +89,18 @@ CREATE TABLE IF NOT EXISTS signals (
     expected_shortfall                TEXT,
     required_margin                     TEXT,
     score                                 TEXT NOT NULL,
-    score_breakdown                        TEXT  -- JSON blob
+    score_breakdown                        TEXT,  -- JSON blob
+    -- Per docs/architecture.md Section M.2: whether net_entry_cost cleared
+    -- RISK.min_net_credit (a real net credit, not a net debit) at pricing
+    -- time. 0/1, never NULL -- every priced candidate gets a real answer to
+    -- this question, persisted alongside the numbers it was computed from,
+    -- so "why wasn't this shown as an opportunity" is always answerable
+    -- from this table alone, not just from that run's console log.
+    entry_eligible                          INTEGER NOT NULL DEFAULT 0 CHECK (entry_eligible IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts);
+CREATE INDEX IF NOT EXISTS idx_signals_entry_eligible ON signals (entry_eligible);
 
 -- Trades (Phase 7/8 output -- paper and, eventually and only with explicit
 -- approval, live)
