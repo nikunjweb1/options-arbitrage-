@@ -104,6 +104,21 @@ class RiskLimits:
     min_liquidity: float = float(os.getenv("MIN_LIQUIDITY", "0"))
     min_expected_profit: float = float(os.getenv("MIN_EXPECTED_PROFIT", "0"))
 
+    # Added 2026-08-23 per docs/architecture.md Section M.2: a candidate whose
+    # net_entry_cost (== gross entry credit after fees) is at or below this
+    # value is a hard DO_NOT_ENTER, not merely a lower-ranked candidate. The
+    # video-derived math this section documents shows a net-debit entry can
+    # lose its FULL debit in the worst-case (high-momentum) scenario, while a
+    # net-credit entry is worst-case bounded at the credit received -- these
+    # are not symmetric risks, so "rank lower" is not an adequate treatment.
+    # Defaults to 0.0 (the strict mathematical floor: any real credit, however
+    # thin, changes the worst-case shape). Set MIN_NET_CREDIT above 0 via env
+    # to add an explicit safety margin once real fee/slippage variance is
+    # better understood (Section M.2 calls for "a safety margin" without
+    # pinning a specific number yet -- that's a deliberate choice to leave
+    # tunable here rather than guess a margin with no empirical basis).
+    min_net_credit: float = float(os.getenv("MIN_NET_CREDIT", "0"))
+
 
 @dataclass(frozen=True)
 class DBConfig:

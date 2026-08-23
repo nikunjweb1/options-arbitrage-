@@ -64,10 +64,32 @@ an accidentally too-narrow one. This is a visibility fix, not a pricing
 fix -- it doesn't change any EV/probability number, it just surfaces the
 inputs that produced it.
 
+MIN_NET_CREDIT GATE ADDED (2026-08-23, docs/architecture.md Section M.2):
+a third-party analysis of this project's source strategy video sharpened
+one point into a concrete, actionable rule: `net_entry_cost` (== gross
+entry credit after fees) must be a real, positive credit for a candidate to
+be tradeable at all -- NOT just a factor that lowers its EV ranking. The
+video's own worked examples (checked and confirmed as sound calendar-spread
+math, independent of the video's still-unverified exchange-specific claims)
+show that in the worst-case (high-momentum) scenario, a net-credit entry is
+bounded at the credit received, while a net-debit entry loses its FULL
+debit -- these are not symmetric risks a single EV number captures well.
+Every priced candidate is now tagged `entry_eligible` (persisted as its own
+`signals` column, not just buried in `score_breakdown`) based on
+`net_entry_cost > RISK.min_net_credit` (config/settings.py, default 0.0).
+Net-debit/ineligible candidates are still priced and persisted (never
+silently dropped -- consistent with this codebase's fail-closed,
+show-your-work approach elsewhere), but are excluded from the ranked
+Top-N/Bottom-N "opportunities" display, which now only shows
+entry_eligible candidates -- ranking a DO_NOT_ENTER candidate alongside
+real opportunities was exactly the "left implicit in the EV ranking" gap
+Section M.2 called out.
+
 Usage:
     python -m pricing.run_pricing --underlying BTC
     python -m pricing.run_pricing --underlying BTC --min-confidence 0.8 --limit 50
     python -m pricing.run_pricing --underlying BTC --dry-run
+    python -m pricing.run_pricing --underlying BTC --min-net-credit 0.5
 
 Requires network access to Delta's REST API (testnet by default, per
 config/settings.py DELTA.use_testnet) -- this fetches LIVE tickers, it does
@@ -86,7 +108,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-from config.settings import COLLECTOR, DB
+from config.settings import COLLECTOR, DB, RISK
 from exchange_adapters.delta import DeltaAdapter, DeltaAdapterError
 from matching.schemas import Classification, MatchCandidate
 from normalization.schemas import (
@@ -110,6 +132,30 @@ logger = logging.getLogger("pricing.run_pricing")
 _ADAPTERS = {
     "delta_india": DeltaAdapter(),
 }
+
+
+def _ensure_entry_eligible_column(conn: sqlite3.Connection) -> None:
+    """
+    Idempotent migration for DBs created before the MIN_NET_CREDIT gate
+    (2026-08-23, Section M.2) added `signals.entry_eligible`. db/schema.sql's
+    `CREATE TABLE IF NOT EXISTS` won't retrofit a new column onto an
+    already-existing table, so this ALTER TABLE runs on every startup and is
+    a no-op (caught, not re-raised) once the column already exists.
+
+    Backfill default is 1 (eligible), not 0: existing signal rows were
+    written before this gate existed, so their net_entry_cost was never
+    actually screened against MIN_NET_CREDIT -- defaulting them to 0 would
+    silently assert "these were checked and failed," which is false. 1 says
+    "not yet screened by this rule," which is the honest state, and matches
+    the column's own DEFAULT 1 in schema.sql.
+    """
+    try:
+        conn.execute("ALTER TABLE signals ADD COLUMN entry_eligible INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
+        logger.info("Migrated: added signals.entry_eligible column (backfilled to 1 for existing rows).")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def _row_to_contract(row: sqlite3.Row) -> OptionContract | None:
@@ -268,13 +314,25 @@ def _fetch_snapshot(
     return snapshot
 
 
-def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
+def _passes_min_net_credit(result: EVResult, threshold: Decimal) -> bool:
+    """
+    Section M.2's gate: net_entry_cost must be a real credit above the
+    configured safety margin. Strictly greater-than, not >=, since a
+    net_entry_cost exactly equal to the threshold (e.g. exactly $0 at the
+    default threshold) is not "a real net credit" per the video's own
+    worked-example framing this section is built from.
+    """
+    return result.net_entry_cost > threshold
+
+
+def _persist_results(conn: sqlite3.Connection, results: list[EVResult], min_net_credit: Decimal) -> None:
     now = datetime.now(timezone.utc).isoformat()
     rows = []
     for r in results:
         # Lean ranking heuristic -- see module docstring. Not a calibrated
         # score; a simplification, not a hidden claim of statistical rigor.
         score = r.expected_value * r.probability_of_profit
+        eligible = _passes_min_net_credit(r, min_net_credit)
         breakdown = {
             "expected_value": str(r.expected_value),
             "probability_of_profit": str(r.probability_of_profit),
@@ -289,19 +347,25 @@ def _persist_results(conn: sqlite3.Connection, results: list[EVResult]) -> None:
             "sigma_move": r.sigma_move,
             "base_iv_used": r.base_iv_used,
             "model_notes": list(r.model_notes),
+            # Redundant with the entry_eligible column below, kept here too
+            # so score_breakdown alone is still self-explanatory for anyone
+            # querying just that JSON blob without joining the column.
+            "entry_eligible": eligible,
+            "min_net_credit_threshold": str(min_net_credit),
         }
         rows.append((
             str(uuid.uuid4()), now, r.pair_id,
             str(r.net_entry_cost), str(r.expected_value), str(r.expected_value),
             str(r.probability_of_profit), None, None, None,
-            str(score), json.dumps(breakdown),
+            str(score), json.dumps(breakdown), int(eligible),
         ))
     conn.executemany(
         """
         INSERT INTO signals (
             signal_id, ts, pair_id, net_entry_cost, expected_value, expected_profit,
-            prob_of_profit, var_95, expected_shortfall, required_margin, score, score_breakdown
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            prob_of_profit, var_95, expected_shortfall, required_margin, score, score_breakdown,
+            entry_eligible
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -342,9 +406,15 @@ def main() -> int:
                               "both tails of the distribution are always visible, even in datasets (like the "
                               "699-candidate run on 2026-08-22) where the number of positive-EV results is "
                               "smaller than --top and the negative tail would otherwise get crowded out.")
+    parser.add_argument("--min-net-credit", type=float, default=None,
+                         help="Section M.2 hard gate: candidates with net_entry_cost at or below this value are "
+                              "DO_NOT_ENTER, excluded from the Top/Bottom ranking display (though still priced "
+                              "and persisted with entry_eligible=0 for visibility). Defaults to "
+                              "config.settings.RISK.min_net_credit (itself defaulting to 0.0) if not given here.")
     parser.add_argument("--dry-run", action="store_true", help="Print results without writing to `signals`.")
     args = parser.parse_args()
     bottom_n = args.bottom if args.bottom is not None else args.top
+    min_net_credit = Decimal(str(args.min_net_credit if args.min_net_credit is not None else RISK.min_net_credit))
 
     if not DB.sqlite_path.exists():
         logger.error("No database found at %s. Run db/init_db.py and the collectors/matcher first.", DB.sqlite_path)
@@ -352,6 +422,7 @@ def main() -> int:
 
     conn = sqlite3.connect(DB.sqlite_path)
     conn.execute("PRAGMA foreign_keys = ON;")
+    _ensure_entry_eligible_column(conn)
 
     candidates, skipped_expired = _load_candidates(
         conn, args.underlying, Decimal(str(args.min_confidence)), args.classification, args.limit
@@ -431,16 +502,29 @@ def main() -> int:
             logger.info("  ...%d/%d processed", i, len(candidates))
 
     positive_ev = [r for r in results if r.expected_value > 0]
+    eligible_results = [r for r in results if _passes_min_net_credit(r, min_net_credit)]
+    blocked_results = [r for r in results if not _passes_min_net_credit(r, min_net_credit)]
+
     logger.info(
         "Result: %d priced, %d skipped (already expired), %d skipped (no executable live data), "
         "%d skipped (no fee schedule), %d of %d priced show positive EV.",
         len(results), skipped_expired, skipped_no_data, skipped_no_fees, len(positive_ev), len(results),
     )
+    logger.info(
+        "MIN_NET_CREDIT gate (Section M.2, threshold=%s): %d/%d priced candidate(s) pass (net-credit, "
+        "entry_eligible=1), %d BLOCKED as DO_NOT_ENTER (net-debit or below the safety margin, "
+        "entry_eligible=0) -- blocked candidates are still priced and persisted for visibility, but "
+        "excluded from the ranking below. See docs/architecture.md Section M.2 for why net-debit "
+        "entries are gated out entirely rather than just ranked lower.",
+        min_net_credit, len(eligible_results), len(results), len(blocked_results),
+    )
 
-    ranked = sorted(results, key=lambda r: r.expected_value, reverse=True)
+    ranked = sorted(eligible_results, key=lambda r: r.expected_value, reverse=True)
 
-    logger.info("Top %d by EV (each line: EV, P(profit), net entry, fees, hours-to-short-expiry, "
-                "sigma_move, IV used, pair id) --", min(args.top, len(ranked)))
+    logger.info(
+        "Top %d entry_eligible by EV (each line: EV, P(profit), net entry, fees, hours-to-short-expiry, "
+        "sigma_move, IV used, pair id) --", min(args.top, len(ranked)),
+    )
     for r in ranked[: args.top]:
         _log_result_line(r)
 
@@ -448,8 +532,18 @@ def main() -> int:
         bottom_slice = ranked[-bottom_n:] if bottom_n < len(ranked) else ranked
         # Print ascending (worst first) so the most negative EV leads --
         # mirrors how the top section leads with the highest EV.
-        logger.info("Bottom %d by EV, for comparison --", min(bottom_n, len(ranked)))
+        logger.info("Bottom %d entry_eligible by EV, for comparison --", min(bottom_n, len(ranked)))
         for r in sorted(bottom_slice, key=lambda r: r.expected_value):
+            _log_result_line(r)
+
+    if blocked_results:
+        blocked_ranked = sorted(blocked_results, key=lambda r: r.net_entry_cost, reverse=True)
+        near_miss_n = min(5, len(blocked_ranked))
+        logger.info(
+            "BLOCKED (DO_NOT_ENTER, net-debit) -- %d closest-to-eligible, for visibility only, "
+            "NOT trading candidates --", near_miss_n,
+        )
+        for r in blocked_ranked[:near_miss_n]:
             _log_result_line(r)
 
     # Quick aggregate check on the P(profit) split itself: how many results
@@ -469,8 +563,11 @@ def main() -> int:
     if args.dry_run:
         logger.info("--dry-run: not writing to `signals`.")
     else:
-        _persist_results(conn, results)
-        logger.info("Wrote %d signal(s) to `signals`.", len(results))
+        _persist_results(conn, results, min_net_credit)
+        logger.info(
+            "Wrote %d signal(s) to `signals` (%d entry_eligible=1, %d entry_eligible=0).",
+            len(results), len(eligible_results), len(blocked_results),
+        )
 
     conn.close()
     return 0

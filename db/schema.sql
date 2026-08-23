@@ -89,10 +89,22 @@ CREATE TABLE IF NOT EXISTS signals (
     expected_shortfall                TEXT,
     required_margin                     TEXT,
     score                                 TEXT NOT NULL,
-    score_breakdown                        TEXT  -- JSON blob
+    score_breakdown                        TEXT, -- JSON blob
+    -- Per docs/architecture.md Section M.2/H: net_entry_cost <= MIN_NET_CREDIT
+    -- (config.settings.RISK.min_net_credit) is a hard DO_NOT_ENTER condition,
+    -- not just a lower rank. Stored as an explicit column (not just buried in
+    -- score_breakdown JSON) so the risk engine (Phase 9) and any manual query
+    -- can filter on it directly. 1 = passes gate (net-credit, tradeable per
+    -- this rule alone), 0 = blocked (net-debit or below the safety margin).
+    -- Existing rows from before this column existed get backfilled to 1
+    -- (assumed-eligible) by the migration in pricing/run_pricing.py's
+    -- _ensure_entry_eligible_column -- see that function's docstring for why
+    -- that default, not 0, is the correct backfill value.
+    entry_eligible                          INTEGER NOT NULL DEFAULT 1 CHECK (entry_eligible IN (0, 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts);
+CREATE INDEX IF NOT EXISTS idx_signals_entry_eligible ON signals (entry_eligible);
 
 -- Trades (Phase 7/8 output -- paper and, eventually and only with explicit
 -- approval, live)
