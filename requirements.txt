@@ -6,6 +6,12 @@ requests>=2.31.0
 websocket-client>=1.7.0
 python-dotenv>=1.0.0
 
+# Shark Exchange uses Socket.IO (Engine.IO v4) for its WebSocket feeds, unlike
+# Delta's plain WebSocket -- see exchange_adapters/shark_ws_capture.py. This
+# handles the Engine.IO handshake/sid negotiation correctly; do not hand-roll
+# that protocol layer.
+python-socketio[client]>=5.11.0
+
 # Data handling
 pandas>=2.1.0
 
