@@ -31,7 +31,11 @@ See Section M.7. **Same day, one more pass:** CoinSwitch's real developer portal
 and read directly (concrete auth scheme, base URL, and the exact one-email access-request
 process — Section M.8), and Shark's own legal Trading Policy was found to require a separate
 "Qualifying User" approval to write/short options, on top of M.7's finding that no options
-order API exists there at all yet. See Section M.8.
+order API exists there at all yet. See Section M.8. **Same day, independent re-check:**
+Section M.9 records a separate, independent re-verification pass that reached the identical
+conclusion as M.7 (Shark's documented API is Futures-only) after a competing AI-generated
+summary claimed otherwise, plus one new corroborating legal-document source and a concrete
+low-cost next step to close the one remaining gap in confidence.
 
 ---
 
@@ -60,7 +64,7 @@ independently re-verified in this pass — see Section M.6.
 |---|---|---|---|
 | **Delta Exchange India** | Yes — full public REST v2 + WebSocket, testnet, official SDKs | Yes: European, cash-settled, 30-min TWAP, fixed 5:30 PM IST | **Primary exchange, in active use. Phase 2/3/5 all built and validated.** |
 | **CoinSwitch PRO** | Options API confirmed "available on request" (not self-serve) — see Section M.6. Spot/Futures/HFT have full public docs and SDKs; Options does not. | Marketing/product pages found (USDT-settled, 11 expiries, fees from 0.015%); exact settlement price formula (TWAP vs. spot vs. custom index) still not found in any public document — see Section M.6. | Still blocked on the settlement-formula gap specifically; API access itself is requestable, not yet requested. |
-| **Shark Exchange** | **Official, documented REST API confirmed to exist (`docs.sharkexchange.in`) — but it is Futures-only.** No options endpoints found anywhere in that reference. Options market data is only reachable via the reverse-engineered public websocket feed (`shark_ws.py`, confirmed working against real captured payloads). No options order-placement path exists, documented or otherwise. See Section M.7. | **Partially confirmed from primary sources (2026-08-23):** live contract-details page confirms `Delivery Time: 01:30 PM`, cash-settled. Official support docs confirm real fee/P&L formulas (Section M.6). Exact "Delivery Price" reference construction (TWAP? which index? what window?) still undocumented anywhere found. | Options market-data path is real and working (websocket); options execution path remains fully blocked — there is no documented options trading API, only a documented Futures one. |
+| **Shark Exchange** | **Official, documented REST API confirmed to exist (`docs.sharkexchange.in`) — but it is Futures-only.** No options endpoints found anywhere in that reference, confirmed via two independent full reads (Section M.7, M.9). Options market data is only reachable via the reverse-engineered public websocket feed (`shark_ws.py`, confirmed working against real captured payloads). No options order-placement path exists, documented or otherwise. | **Partially confirmed from primary sources (2026-08-23):** live contract-details page confirms `Delivery Time: 01:30 PM`, cash-settled. Official support docs confirm real fee/P&L formulas (Section M.6). Shark's own legal Trading Policy independently confirms options as a real contractual product (Section M.9). Exact "Delivery Price" reference construction (TWAP? which index? what window?) still undocumented anywhere found. | Options market-data path is real and working (websocket); options execution path remains fully blocked — there is no documented options trading API, only a documented Futures one. High confidence, not yet certain — see Section M.9 for the one residual gap and the recommended next step. |
 
 ---
 
@@ -160,13 +164,13 @@ retries transient network errors with backoff), `exchange_adapters/delta_ws.py` 
 
 | Item | Delta Exchange India | CoinSwitch PRO | Shark Exchange |
 |---|---|---|---|
-| REST base URL | `https://api.india.delta.exchange` (prod) / `cdn-ind.testnet.deltaex.org` (testnet) | Not publicly documented for options specifically (Spot/Futures/HFT have `api-trading.coinswitch.co` docs) | `https://api.sharkexchange.in/` — **official, documented (`docs.sharkexchange.in`), but Futures-only.** No options endpoints exist in this reference. See Section M.7. |
+| REST base URL | `https://api.india.delta.exchange` (prod) / `cdn-ind.testnet.deltaex.org` (testnet) | Not publicly documented for options specifically (Spot/Futures/HFT have `api-trading.coinswitch.co` docs) | `https://api.sharkexchange.in/` — **official, documented (`docs.sharkexchange.in`), but Futures-only.** No options endpoints exist in this reference. See Section M.7, M.9. |
 | WebSocket | `wss://socket.india.delta.exchange` | Unknown for options | Public options data feed at `fawss-options.sharkexchange.in` (reverse-engineered, confirmed working — Section M.6/`shark_ws.py`). No documented options WebSocket; Shark's own docs cover Futures WebSockets (public + authenticated) only. |
 | Settlement time | Fixed at 5:30 PM IST for every contract | Claimed 1:30 PM IST (video) — not independently re-verified this pass | **Confirmed 1:30 PM IST** — project owner's direct check + Shark's own live contract-details page (`Delivery Time: 01:30 PM`), 2026-08-23 |
 | Settlement price formula | `max(30-min TWAP index − strike, 0)` for calls, mirrored for puts | Not documented publicly | Formula shape confirmed (`max(Delivery Price − Strike, 0) × Qty + Premium − Delivery Fee − Trading Fee`, per Shark's own support docs), but the exact construction of "Delivery Price" itself (TWAP? window? which index?) is not defined in any document found — see Section M.6 |
 | Fees | Maker/taker on notional; capped at 7.5–12.5% of premium; zero settlement fee on OTM; 18% GST (India accounts) | Trading fees from 0.015% (marketing figure, not a full schedule) | **Confirmed from official docs:** Trading fee = min(0.012% × index price, 12.5% × option price), capped at 5% of option price; Delivery fee = min(0.015% × delivery price, 12.5% × (delivery − strike)); 18% GST separate |
 | Settlement currency | Same as quote currency | Unknown | **USDT-quoted, INR-settled** — a currency-basis risk not previously flagged, see Section M.6 |
-| Authenticated order API | Full REST v2, official SDKs | Options: request-only, not self-serve | **Full REST API confirmed for Futures** (place/edit/cancel orders, positions, margin, leverage — HMAC-SHA256 signed). **No equivalent exists for Options anywhere in the same reference.** See Section M.7. |
+| Authenticated order API | Full REST v2, official SDKs | Options: request-only, not self-serve | **Full REST API confirmed for Futures** (place/edit/cancel orders, positions, margin, leverage — HMAC-SHA256 signed). **No equivalent exists for Options anywhere in the same reference** — confirmed via two independent full reads, Section M.7 and M.9. |
 
 ---
 
@@ -337,7 +341,7 @@ already in this table, confirming the existing taxonomy rather than requiring ne
 | Basis risk (index discrepancy) | Settlement risk + Contract-spec risk (Section C.2/C.6) — **narrowed but not resolved for Shark, see Section M.6**: formula shape confirmed, exact reference-price construction still undocumented |
 | Contract multiplier mismatch ("90% unhedged") | Contract-spec risk (Section C.4) — reinforces why multiplier is never hardcoded (see Section C note above). Still unresolved for both CoinSwitch and Shark. |
 | **New (2026-08-23): currency-basis risk** (Shark quotes USDT, settles INR) | **Not previously a tracked risk category** — add as its own line item once a Shark adapter exists, per Section C's new note. |
-| **New (2026-08-23, Section M.7): options execution-path risk** (no documented options order API on Shark at all, only Futures) | **Not previously a tracked risk category.** This is stronger than "basis risk" or "multiplier risk" — it's a complete absence of any way to place, edit, or cancel an options order on Shark programmatically. Track as its own blocking item, not folded into the existing execution-latency row, since it isn't a latency problem — there's no endpoint to be slow. |
+| **New (2026-08-23, Section M.7): options execution-path risk** (no documented options order API on Shark at all, only Futures) | **Not previously a tracked risk category.** This is stronger than "basis risk" or "multiplier risk" — it's a complete absence of any way to place, edit, or cancel an options order on Shark programmatically. Track as its own blocking item, not folded into the existing execution-latency row, since it isn't a latency problem — there's no endpoint to be slow. Independently re-confirmed, Section M.9. |
 
 `MIN_NET_CREDIT` is now live in the hard-limits list (`config/settings.py` `RiskLimits.min_net_credit`,
 alongside `MAX_TOTAL_CAPITAL`, `MAX_MARGIN_PER_TRADE`, etc.) — a candidate with
@@ -350,11 +354,11 @@ pending, per this section's original scope.
 ## I. Implementation roadmap — STATUS AS OF v2.1
 
 **Phase 1 — Research.** ✅ Done. **CoinSwitch/Shark verification targets from Section M.4
-partially resolved 2026-08-23 — see Section M.6/M.7. Settlement-time claim confirmed for
+partially resolved 2026-08-23 — see Section M.6/M.7/M.9. Settlement-time claim confirmed for
 Shark (two independent sources) and personally confirmed by the project owner for both.
 Settlement price formula and contract multiplier remain open for both. Shark's official REST
-API located and confirmed Futures-only (Section M.7) — options execution path remains fully
-blocked, not just under-documented.**
+API located and confirmed Futures-only, independently re-verified twice (Section M.7, M.9) —
+options execution path remains fully blocked, not just under-documented.**
 
 **Phase 2 — Market-data collectors.** ✅ Done (Delta). Shark options market data now has a
 confirmed-working reverse-engineered websocket path (`shark_ws.py`, Section M.6) — not yet
@@ -390,23 +394,24 @@ per Section G.2, including Section M's four named stress scenarios.
 `LIVE_TRADING = FALSE` hardcoded regardless. Execution engine's default exit rule for this
 strategy confirmed as Exit A (close long leg at T1) per Section M.3 — matches the video's own
 mechanism exactly, so this isn't an open design choice anymore for this specific strategy.
-**Per Section M.7: Shark cannot be a target for this phase's options execution regardless of
-LIVE_TRADING's value, since no options order-placement API exists to build an adapter
-against. A Shark Futures adapter is a separate, buildable, real option if a futures strategy
-is ever wanted — not part of this phase's options-arbitrage scope.**
+**Per Section M.7/M.9: Shark cannot be a target for this phase's options execution regardless
+of LIVE_TRADING's value, since no options order-placement API exists to build an adapter
+against — confirmed independently twice. A Shark Futures adapter is a separate, buildable,
+real option if a futures strategy is ever wanted — not part of this phase's options-arbitrage
+scope.**
 
 **Phase 10 — Live trading.** Enabled only after explicit, separate approval, and only if the
 lean backtest + paper trading both show a real, cost-inclusive, positive edge, **and** the
-cross-exchange leg's remaining open items in Section M.6/M.7 (settlement price formula,
+cross-exchange leg's remaining open items in Section M.6/M.7/M.9 (settlement price formula,
 contract multiplier, API access/reliability) are resolved for whichever of CoinSwitch/Shark is
 actually used — the Delta-only same-exchange version of this strategy does not depend on
 these, but the cross-exchange version the source video actually describes does. **For Shark
 specifically, this phase cannot proceed for options at all until Shark either publishes an
 options trading API or the project owner gets direct confirmation from Shark support that one
-exists outside the public reference docs.**
+exists outside the public reference docs — see Section M.9 for the exact question to ask.**
 
 **Explicitly deferred (not cancelled):** full v1 backtest matrix, dashboard, alerting,
-CoinSwitch/Shark adapters (still blocked on the items in Section M.6/M.7).
+CoinSwitch/Shark adapters (still blocked on the items in Section M.6/M.7/M.9).
 
 ---
 
@@ -566,14 +571,15 @@ before this cross-exchange leg of the strategy is trusted with real capital:
    on their API (rate limits, latency, downtime), that's Section M.3's exit trigger becoming
    Section M.1's "Scenario 4" (execution failure) by default, not by exception. **For Shark:
    this question no longer even applies in the "is it reliable" sense — there is no options
-   order-placement API to be reliable or unreliable, documented or otherwise (Section M.7).
-   For CoinSwitch: still open — options API is confirmed request-only (not self-serve), so
-   this can't be assessed until access is requested. See Section M.6/M.7.**
+   order-placement API to be reliable or unreliable, documented or otherwise (Section M.7,
+   independently re-confirmed M.9). For CoinSwitch: still open — options API is confirmed
+   request-only (not self-serve), so this can't be assessed until access is requested. See
+   Section M.6/M.8.**
 
 None of this is resolvable from a video, however good the analysis. **This remains the single
 highest-priority blocker to trading the actual cross-exchange version of this strategy for
 real money**, though item 1 is now resolved and items 2-3 are meaningfully narrowed for Shark
-specifically — see Section M.6/M.7 for exactly what's confirmed vs. still open.
+specifically — see Section M.6/M.7/M.9 for exactly what's confirmed vs. still open.
 
 ### M.5 Four scenarios — adopted as named stress-test cases (Section G.2)
 
@@ -644,7 +650,7 @@ sources from marketing copy:
   adapter is eventually built — never hardcoded from any source, video or otherwise.
 - **API reliability for the manual-close-at-T1 execution** — genuinely can't be assessed for
   CoinSwitch until options API access is requested and granted; **for Shark, this question is
-  now superseded by Section M.7's finding: there is no options order API at all, so the
+  now superseded by Section M.7/M.9's finding: there is no options order API at all, so the
   question isn't "how reliable is it" but "it doesn't exist."**
 - **"Mirror Web" vs. "Mirror Pip"** — resolved same day, see Section K.
 
@@ -653,9 +659,9 @@ what Phases 2-6 are built and tested against) is unaffected by any of this — i
 on CoinSwitch or Shark at all. The cross-exchange version the source video actually describes
 is meaningfully closer to buildable than it was on the data side (settlement timing confirmed,
 fee/P&L formula shape confirmed for Shark, options websocket market data now working), but the
-settlement-price reference construction, contract multiplier, and — as of Section M.7 — the
-complete absence of a documented Shark options execution path remain the concrete blockers to
-trading this for real money.
+settlement-price reference construction, contract multiplier, and — as of Section M.7/M.9 —
+the complete absence of a documented Shark options execution path remain the concrete blockers
+to trading this for real money.
 
 ### M.7 Shark has an official, documented REST API — but it's Futures-only, not Options (2026-08-23)
 
@@ -786,3 +792,34 @@ exchanges) and wasn't corroborated by any primary source found. The same summary
 from Shark's own support docs in M.6. Neither is incorporated as fact here — flagged instead,
 since propagating an unverified secondary claim into this document would undermine the whole
 point of citing primary sources throughout.
+
+### M.9 Independent re-verification of M.7's finding, same conclusion, one new source (2026-08-23)
+
+A separate research pass, prompted by another AI-generated summary claiming Shark's documented
+API *does* support options order placement, independently re-read `docs.sharkexchange.in`'s
+complete `Orders` section end to end, twice, at different fetch depths. Same result as M.7:
+every endpoint, every parameter table, every example request/response uses
+`contractType: "PERPETUAL"` — no strike, no expiry, no options order type anywhere. The
+`Place an Order` parameter table specifically has no field for either. This independently
+confirms M.7 rather than changing it.
+
+**One genuinely new corroborating source, worth recording:** Shark's own legal Trading Policy
+(not the API reference, not marketing copy) defines its Services as including *"trading with
+the User in VDA/crypto perpetual futures **or Options pairs** (with an option for us to seek
+delivery in accordance with the User Terms and Conditions and this Trading Policy), for a
+Transaction Fee."* This is a third independent confirmation (alongside the live contract page
+and support docs in M.6) that options are a real, contractually-defined product on Shark —
+useful because it comes from a different document class (legal terms, not UI or support
+content) than the sources M.6 already cited.
+
+**Residual gap, not fully closed:** the fetch tool used for this pass truncated
+`docs.sharkexchange.in` at the same point both times (end of the `Orders` section, before
+`Public Endpoints`, `WebSockets`, and `Error Codes`), so those three sections were not directly
+read in this pass. Nothing in web search surfaced an options-specific endpoint in them either.
+Given the complete `Orders` section — the only place an options order-placement endpoint could
+plausibly live — was read in full twice with a consistent result, this is treated as
+high-confidence, not certain. **Concrete next step to close this with certainty, cheaper than
+further scraping attempts: email `support@sharkexchange.in` directly asking whether
+`/v1/order/place-order` supports `contractType: OPTIONS`, or whether options trading is
+currently website-only.** A five-minute email settles this definitively; continuing to probe
+around a documentation-tool truncation limit does not.
