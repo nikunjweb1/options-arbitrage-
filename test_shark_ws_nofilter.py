@@ -17,6 +17,11 @@ question) or confirms it genuinely isn't (a different problem).
 Also logs every event at DEBUG, not just the three confirmed handlers, so
 nothing is silently missed.
 
+NOTE (2026-08-24): SharkWebSocketClient's constructor was simplified
+locally (uncommitted at the time this was first written) to no longer
+require an explicit host= argument -- it now defaults ws_url to the
+confirmed real host. Updated to match.
+
 Usage:
     python test_shark_ws_nofilter.py
 """
@@ -48,7 +53,7 @@ def on_snapshot(snapshot) -> None:
 
 
 def main() -> None:
-    client = SharkWebSocketClient(host="fawss-options.sharkexchange.in", on_snapshot=on_snapshot)
+    client = SharkWebSocketClient(on_snapshot=on_snapshot)
 
     print("Connecting (no subscribe -- listening for ANY unsolicited data)...")
     client.start()
