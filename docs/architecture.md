@@ -27,7 +27,11 @@ primary sources vs. what's still open. **Later update, same day:** Shark's real 
 websocket ticker/orderBook/indexPrice payloads were captured and the `shark_ws.py` parsers
 filled in from real data. **Later still, same day:** Shark's official, documented REST API
 (`docs.sharkexchange.in`) was located and confirmed — but it is Futures-only, not Options.
-See Section M.7.
+See Section M.7. **Same day, one more pass:** CoinSwitch's real developer portal was found
+and read directly (concrete auth scheme, base URL, and the exact one-email access-request
+process — Section M.8), and Shark's own legal Trading Policy was found to require a separate
+"Qualifying User" approval to write/short options, on top of M.7's finding that no options
+order API exists there at all yet. See Section M.8.
 
 ---
 
@@ -724,3 +728,61 @@ orders against Shark's Futures API today. Per this project's existing
 this repo calls the authenticated order-placement endpoints yet, and any
 future work that does must read credentials from environment/secrets
 storage only — never hardcoded, never logged, never committed.
+
+### M.8 CoinSwitch's real technical access path, and one more Shark finding (2026-08-23, same day)
+
+Two more findings from the same research pass that produced M.7, kept separate because they're
+genuinely additive rather than corrections to it.
+
+**CoinSwitch: the "available on request" status from M.6 has a concrete, technical shape.**
+`api-trading.coinswitch.co` is a real, current developer portal (not a marketing page) with
+four API surfaces — Spot, Futures, HFT, and Options (labeled "Private beta"). The useful
+finding: **options rides on the same infrastructure as the already-public HFT API**, not a
+separate system. Concretely:
+- HFT base URL: `https://dma.coinswitch.co`. Paths: `/v5/market/...`, `/v5/order/...`,
+  `/v5/position/...`, `/v5/execution/...`.
+- Auth: Ed25519 signature — `X-AUTH-APIKEY`, `X-AUTH-SIGNATURE`, `X-AUTH-EPOCH` headers,
+  signature over `METHOD + path_with_query + epoch`.
+- Response envelope: `{"retCode": 0, "retMsg": "OK", "result": {...}, "retExtInfo": {}, "time": ...}`
+  — different shape from Delta's, needs its own parser.
+- Once allowlisted, options orders use the same HFT endpoints as futures, distinguished by
+  `"category": "option"` instead of `"category": "linear"`.
+- **HFT futures itself needs no application** — only the `option` category is gated. This
+  means the adapter's plumbing (auth, envelope parsing, error handling) can be built and
+  tested against the already-working futures endpoints today, with only the options-specific
+  calls stubbed until access arrives.
+
+**The actual access request, verbatim from `api-trading.coinswitch.co/options/access`:**
+email **api@coinswitch.co** from the CoinSwitch-registered email, subject **"Request for
+Options Trading API Access"**, include the public API key. A private-beta allowlist request,
+not a formal business-development process with a published SLA. Worth asking in the same
+email (costs nothing extra): daily settlement time, settlement price formula, and the options
+symbol format — all still open per Section M.4/M.6.
+
+**Shark: an additional, different kind of gate found in Shark's legal documents (not the API
+reference docs M.7 examined).** Shark's own Trading Policy states: "Qualifying Users means
+Users whom the Company has agreed shall be permitted to provide liquidity in Options and to
+issue/write (and take short positions in respect of) Option Contracts, subject to the
+satisfaction of applicable Margin Requirements." Shark's Risk Disclosures confirm this is a
+granted status, not automatic: "Margin & Liquidation Risk (For Qualifying Users Only) — If I
+am granted access to write/sell options...".
+
+**How this interacts with M.7's finding, stated plainly so it isn't misread as a bigger deal
+than it is:** M.7 already established there is no documented options order-placement endpoint
+on Shark at all — so right now, *no account*, qualifying or not, has an API path to write a
+Shark option programmatically. The Qualifying User requirement doesn't change that. It's worth
+recording anyway because (a) it would apply the moment Shark ever does expose such an
+endpoint, and (b) it's relevant to anyone considering the *manual, UI-based* version of this
+leg on Shark, which the source video's presenter appears to be describing rather than an API
+integration. It's a secondary, contextual finding, not an independent blocker on top of M.7's
+stronger one.
+
+**A caution about a secondary source, worth recording precisely:** an AI-generated summary the
+project owner shared alongside genuine `docs.sharkexchange.in` screenshots contained a claim
+that doesn't hold up — it referenced "Delta Exchange India production credentials" in the
+middle of Shark-specific integration advice, which doesn't make sense (they're unrelated
+exchanges) and wasn't corroborated by any primary source found. The same summary's fee claim
+("5-7% of premium, ITM-only") also conflicts with the formula-level figures already sourced
+from Shark's own support docs in M.6. Neither is incorporated as fact here — flagged instead,
+since propagating an unverified secondary claim into this document would undermine the whole
+point of citing primary sources throughout.
