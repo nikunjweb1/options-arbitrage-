@@ -34,24 +34,25 @@ both verified -- not guessed):
     independently-confirmed question -- don't assume the WS event matches
     this REST shape just because they share a name.)
 
-STRONGLY SUSPECTED BUT NOT YET CONFIRMED -- do not call these without
-testing first:
-  Given /v1/market/orderBook exists here with the same path shape as
-  api.sharkexchange.in's documented futures endpoints, it's a reasonable
-  guess (not a confirmed fact) that sibling endpoints exist on this same
-  host following the same /v1/market/* pattern:
-    GET /v1/market/ticker24Hr?symbol=...
-    GET /v1/market/klines?symbol=...
-    GET /v1/market/aggTrade?symbol=...
-  And possibly, for the option-chain-listing gap that's been open all
-  session:
-    GET /v1/exchange/exchangeInfo  (an OPTIONS-scoped version, distinct
-      from api.sharkexchange.in's confirmed-futures-only version of the
-      same path)
-  NONE of these are implemented below. Test each one for real (hit the URL
-  directly, or capture it from a live DevTools session) before adding it --
-  per this project's own rule, guessed-but-untested endpoints don't get
-  wired into working code, they get flagged as the next thing to check.
+CONFIRMED NOT TO EXIST (tested directly, 2026-08-24) -- do not re-try these
+guesses, they were reasonable but wrong:
+    GET /v1/exchange/exchangeInfo        -> 404 {"message":"Cannot GET
+      /v1/exchange/exchangeInfo","error":"Not Found","statusCode":404}
+    GET /v1/market/ticker24Hr?symbol=... -> same 404 shape
+  So this host does NOT simply mirror api.sharkexchange.in's documented
+  /v1/market/* and /v1/exchange/* path patterns for every endpoint -- only
+  orderBook (confirmed above) is known to exist here. Don't assume path-name
+  symmetry with the futures API going forward; each endpoint needs its own
+  real confirmation.
+
+  The more promising lead for get_option_chain(), still untested: the
+  actual endpoint NAMES seen firing from the live options page's Fetch/XHR
+  panel earlier this session -- basePairs, delivery-times, options-tier-info,
+  instrument-info, and a paginated list?page=...&pageSize=...&isPast=...
+  request. Those are real observed request names, not guesses by analogy,
+  so they're worth testing on this host (and were originally seen without a
+  confirmed host at all -- confirming they live on api-options.sharkexchange.in
+  specifically, the same way orderBook did, is the next concrete step).
 """
 
 from __future__ import annotations
