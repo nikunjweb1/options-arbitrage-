@@ -1,13 +1,13 @@
 """
 Shark Exchange WebSocket client -- real-time OPTIONS market data.
 
-CONFIRMATION STATUS -- major update 2026-08-23. The previous version of
-this file was a scaffold built entirely from unconfirmed guesses (see git
-history). It has now been rewritten against REAL frames captured directly
-from a live sharkexchange.in options session via browser DevTools
-(Network tab -> WS -> Messages sub-tab), while the option chain for
-BTC-USDT was actively streaming. What follows is genuinely confirmed, not
-inferred.
+CONFIRMATION STATUS -- major update 2026-08-23, now with the connection
+host independently confirmed (previously inferred, then proven wrong by a
+live 404 -- see below). This file was rewritten against REAL frames
+captured directly from a live sharkexchange.in options session via browser
+DevTools (Network tab -> WS -> Messages/Headers sub-tabs), while the option
+chain for BTC-USDT was actively streaming. What follows is genuinely
+confirmed, not inferred, except where explicitly marked otherwise.
 
 CONFIRMED, from real captured frames:
   - Transport protocol is standard Engine.IO v4 + Socket.IO v4 -- NOT a
@@ -15,7 +15,7 @@ CONFIRMED, from real captured frames:
     connection (what this file used before, and what delta_ws.py correctly
     uses for Delta's genuinely-raw WS) CANNOT correctly speak this protocol
     -- it doesn't do the Engine.IO handshake, upgrade dance, or Socket.IO
-    packet-type framing. This file now uses the `python-socketio` client
+    packet-type framing. This file uses the `python-socketio` client
     library instead, which speaks this protocol properly.
   - Confirmed handshake, in order (captured via DevTools XHR-polling
     frames before the WS upgrade): Engine.IO open packet
@@ -24,6 +24,35 @@ CONFIRMED, from real captured frames:
     `40{"sid":"..."}` -- both handled automatically by python-socketio,
     documented here only so the shape is understood if something needs
     debugging by hand later.
+  - CONFIRMED WS HOST (2026-08-23, via Headers tab of a live 101-status
+    connection, replacing the earlier inferred-and-wrong
+    `https://api.sharkexchange.in`):
+
+        wss://fawss-options.sharkexchange.in/socket.io/?EIO=4&transport=websocket&sid=...
+
+    This is a genuinely SEPARATE host from Shark's REST API host
+    (api.sharkexchange.in) and from the futures WS host -- see the next
+    point. The earlier guess assumed WS shared the REST host, which was
+    wrong; options market data lives on its own dedicated subdomain.
+  - BONUS FINDING from the same Headers capture: FOUR distinct WS hosts
+    were observed connecting simultaneously on the live options page, not
+    one:
+        wss://fawss-options.sharkexchange.in       -- options public market data (this file uses this one)
+        wss://fawss.sharkexchange.in                -- futures/general public market data (no "-options")
+        wss://fawss-uds-options.sharkexchange.in    -- options AUTHENTICATED stream ("uds" = User Data
+                                                          Stream, same terminology Binance uses for
+                                                          order/position/balance update streams)
+        wss://fawss-uds.sharkexchange.in            -- futures/general authenticated stream
+    This is genuinely useful beyond just fixing the connection: it confirms
+    where the authenticated order/position-update socket for options will
+    live once that's built (fawss-uds-options.sharkexchange.in), and
+    strongly suggests it's the real-time counterpart to the Listen Key
+    lifecycle referenced in docs.sharkexchange.in's sidebar nav (Create/
+    Get/Update/Delete Listen Key) -- i.e. mint a listen key via REST, then
+    connect to fawss-uds-options.sharkexchange.in using it, following the
+    same pattern this module's own bottom section already sketches (see
+    the Listen Key placeholder functions -- still unconfirmed paths, but
+    now with a confirmed destination host to connect the pieces to).
   - Confirmed real event names (captured live, multiple examples of each):
       * "ticker"     -- per-instrument live quote update
       * "orderBook"  -- per-instrument order book update
@@ -53,17 +82,6 @@ CONFIRMED, from real captured frames:
       {"indexPrice": "77242.1492131", "baseCoin": "BTC", "quoteCoin": "USDT"}
 
 STILL NOT CONFIRMED:
-  - The exact wss:// URL. The capture showed the Messages/frame content but
-    not the connection's Request URL. `_WS_URL_INFERRED` below is a
-    reasoned inference, not a guess pulled from nowhere: Shark's REST API
-    is confirmed to live at https://api.sharkexchange.in (see shark.py),
-    and serving Socket.IO off the same host via the conventional
-    `/socket.io/` path is the standard pattern for this protocol. But this
-    specific detail was NOT read off a captured Headers panel the way
-    everything above was. Low-risk to get wrong (a bad WS URL just fails
-    to connect, it doesn't place an order or move money) but still worth
-    confirming for certainty -- see get_confirmed_ws_url()'s docstring for
-    the fastest way to nail it exactly.
   - Whether a "subscribe" call is even required. No outgoing subscribe
     frame was visible in the captured session -- ticker/orderBook/
     indexPrice events for multiple different strikes were streaming
@@ -75,14 +93,14 @@ STILL NOT CONFIRMED:
     ignored) but does NOT rely on it being necessary -- the on_ticker
     handler processes any ticker event received regardless of whether an
     explicit subscribe was acknowledged.
-  - Authenticated (order/position update) channel entirely -- nothing
-    about that was captured in this session, which only exercised public
-    market data. Section is left as a documented gap, not built.
+  - The Listen Key REST paths for the authenticated fawss-uds-options
+    stream -- see this module's bottom section, still placeholder.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
@@ -94,10 +112,17 @@ logger = logging.getLogger("shark_ws")
 
 MarketSnapshotCallback = Callable[[MarketSnapshot], None]
 
-# Reasoned inference, not independently confirmed -- see module docstring's
-# STILL NOT CONFIRMED section. Override via the constructor if a captured
-# Headers panel shows something different.
-_WS_URL_INFERRED = "https://api.sharkexchange.in"
+# CONFIRMED 2026-08-23 via live DevTools Headers capture (Request URL of a
+# real 101 Switching Protocols connection). Replaces the earlier inferred
+# `https://api.sharkexchange.in`, which returned a live 404 -- options
+# market data runs on its own dedicated subdomain, separate from the REST
+# API host and from the futures WS host. See module docstring's BONUS
+# FINDING note for the other three hosts observed alongside this one.
+SHARK_OPTIONS_WS_URL = "https://fawss-options.sharkexchange.in"
+
+# Authenticated counterpart, confirmed to exist (same Headers capture) but
+# not yet wired up -- needs a Listen Key first. See module docstring.
+SHARK_OPTIONS_UDS_WS_URL = "https://fawss-uds-options.sharkexchange.in"
 
 
 class SharkWebSocketClient:
@@ -113,7 +138,7 @@ class SharkWebSocketClient:
     def __init__(
         self,
         on_snapshot: MarketSnapshotCallback,
-        ws_url: str = _WS_URL_INFERRED,
+        ws_url: str = SHARK_OPTIONS_WS_URL,
         reconnection_attempts: int = 0,  # 0 = retry forever, matches delta_ws.py's never-give-up behavior
         reconnection_delay: float = 1.0,
         reconnection_delay_max: float = 30.0,
@@ -231,7 +256,7 @@ class SharkWebSocketClient:
             return None
 
         return MarketSnapshot(
-            timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            timestamp=datetime.now(timezone.utc),
             exchange="shark",
             instrument_id=symbol,
             best_bid=self._dec_or_none(data.get("bidPrice")),
@@ -258,12 +283,30 @@ class SharkWebSocketClient:
         )
 
 
-def get_confirmed_ws_url_instructions() -> str:
-    """
-    Not a runtime function -- a documentation helper for whoever picks this
-    up next. Fastest way to confirm _WS_URL_INFERRED exactly, if it turns
-    out to matter (e.g. if connecting to the inferred URL fails):
-    browser DevTools -> Network tab -> filter "WS" -> click one of the
-    socket.io rows -> Headers tab -> Request URL, top of the panel.
-    """
-    return __doc__ or ""
+# -- Listen Key lifecycle (Authenticated WebSocket, fawss-uds-options) ------
+#
+# PLACEHOLDER PATHS -- not confirmed. Guessed following the Binance/MEXC
+# convention (`/v1/userDataStream` for POST/PUT/DELETE) since Shark's docs
+# sidebar confirms this feature EXISTS (Create/Get/Update/Delete Listen Key
+# are real section headers) but the actual REST paths were never reached in
+# any doc fetch attempt. What IS now confirmed is the destination host to
+# connect to once a listen key is minted: SHARK_OPTIONS_UDS_WS_URL above.
+
+_LISTEN_KEY_PATH_GUESS = "/v1/userDataStream"
+
+
+def create_listen_key(adapter) -> str:
+    """Takes a SharkAdapter (for its signed _post helper) -- PLACEHOLDER path, unconfirmed."""
+    resp = adapter._post(_LISTEN_KEY_PATH_GUESS)
+    return resp["listenKey"]
+
+
+def keepalive_listen_key(adapter, listen_key: str) -> None:
+    raise NotImplementedError(
+        "Needs a signed PUT helper on SharkAdapter (not yet implemented) and a confirmed "
+        "path -- see module docstring."
+    )
+
+
+def delete_listen_key(adapter, listen_key: str) -> None:
+    adapter._delete(_LISTEN_KEY_PATH_GUESS, {"listenKey": listen_key})
