@@ -1,100 +1,86 @@
 """
 Shark Exchange WebSocket client -- real-time OPTIONS market data.
 
-CONFIRMATION STATUS -- major update 2026-08-23, now with the connection
+CONFIRMATION STATUS -- major update 2026-08-23/24, now with the connection
 host independently confirmed (previously inferred, then proven wrong by a
-live 404 -- see below). This file was rewritten against REAL frames
-captured directly from a live sharkexchange.in options session via browser
-DevTools (Network tab -> WS -> Messages/Headers sub-tabs), while the option
-chain for BTC-USDT was actively streaming. What follows is genuinely
-confirmed, not inferred, except where explicitly marked otherwise.
+live 404 -- see below), and a live smoke test run against it (2026-08-24)
+that connects successfully but has not yet received data -- see the
+ZERO-DATA INVESTIGATION note near the bottom, which is the active open
+question as of this revision.
 
 CONFIRMED, from real captured frames:
   - Transport protocol is standard Engine.IO v4 + Socket.IO v4 -- NOT a
-    raw/custom WebSocket protocol. This matters: a plain `websocket-client`
-    connection (what this file used before, and what delta_ws.py correctly
-    uses for Delta's genuinely-raw WS) CANNOT correctly speak this protocol
-    -- it doesn't do the Engine.IO handshake, upgrade dance, or Socket.IO
-    packet-type framing. This file uses the `python-socketio` client
-    library instead, which speaks this protocol properly.
+    raw/custom WebSocket protocol. This file uses the `python-socketio`
+    client library, which speaks this protocol properly (a plain
+    `websocket-client` connection, correct for Delta's genuinely-raw WS in
+    delta_ws.py, CANNOT correctly speak Engine.IO/Socket.IO framing).
   - Confirmed handshake, in order (captured via DevTools XHR-polling
     frames before the WS upgrade): Engine.IO open packet
     `0{"sid":"...","upgrades":["websocket"],"pingInterval":180000,
     "pingTimeout":60000,...}`, then Socket.IO connect packet
-    `40{"sid":"..."}` -- both handled automatically by python-socketio,
-    documented here only so the shape is understood if something needs
-    debugging by hand later.
+    `40{"sid":"..."}` -- both handled automatically by python-socketio.
   - CONFIRMED WS HOST (2026-08-23, via Headers tab of a live 101-status
-    connection, replacing the earlier inferred-and-wrong
-    `https://api.sharkexchange.in`):
+    connection, replacing an earlier inferred-and-wrong
+    `https://api.sharkexchange.in`, which returned a live 404):
 
         wss://fawss-options.sharkexchange.in/socket.io/?EIO=4&transport=websocket&sid=...
 
-    This is a genuinely SEPARATE host from Shark's REST API host
-    (api.sharkexchange.in) and from the futures WS host -- see the next
-    point. The earlier guess assumed WS shared the REST host, which was
-    wrong; options market data lives on its own dedicated subdomain.
+    Independently RE-CONFIRMED 2026-08-24: connecting to this host with
+    python-socketio succeeds (101 Switching Protocols equivalent, stable
+    connection, clean 20s session) -- so the host itself is solid. The
+    open question now (see below) is why no events arrived, not whether
+    the connection works.
   - BONUS FINDING from the same Headers capture: FOUR distinct WS hosts
-    were observed connecting simultaneously on the live options page, not
-    one:
+    run simultaneously on the live options page:
         wss://fawss-options.sharkexchange.in       -- options public market data (this file uses this one)
         wss://fawss.sharkexchange.in                -- futures/general public market data (no "-options")
-        wss://fawss-uds-options.sharkexchange.in    -- options AUTHENTICATED stream ("uds" = User Data
-                                                          Stream, same terminology Binance uses for
-                                                          order/position/balance update streams)
+        wss://fawss-uds-options.sharkexchange.in    -- options AUTHENTICATED stream ("uds" = User Data Stream)
         wss://fawss-uds.sharkexchange.in            -- futures/general authenticated stream
-    This is genuinely useful beyond just fixing the connection: it confirms
-    where the authenticated order/position-update socket for options will
-    live once that's built (fawss-uds-options.sharkexchange.in), and
-    strongly suggests it's the real-time counterpart to the Listen Key
-    lifecycle referenced in docs.sharkexchange.in's sidebar nav (Create/
-    Get/Update/Delete Listen Key) -- i.e. mint a listen key via REST, then
-    connect to fawss-uds-options.sharkexchange.in using it, following the
-    same pattern this module's own bottom section already sketches (see
-    the Listen Key placeholder functions -- still unconfirmed paths, but
-    now with a confirmed destination host to connect the pieces to).
+    Confirms where the authenticated order/position-update socket for
+    options lives once built, likely the live counterpart to the Listen
+    Key REST lifecycle referenced in docs.sharkexchange.in's sidebar (see
+    this file's bottom section).
   - Confirmed real event names (captured live, multiple examples of each):
       * "ticker"     -- per-instrument live quote update
       * "orderBook"  -- per-instrument order book update
       * "indexPrice" -- underlying spot/index price update
   - Confirmed real options symbol format:
       "BTC-24AUG26-73000-P-USDT"  (BTC put, strike 73000, expires 24 Aug 2026, USDT-settled)
-      "BTC-24AUG26-75000-C-USDT"  (BTC call, strike 75000, same expiry)
     Pattern: {BASE}-{DD}{MMM}{YY}-{STRIKE}-{C|P}-{QUOTE}
-    This is the confirmed symbol format needed for get_option_chain() /
-    get_ticker() / place_order() on shark.py -- see that file's updated
-    docstring.
-  - Confirmed "ticker" event fields (from a real captured payload,
-    field list below is exactly what was visible in the captured frame --
-    the frame was truncated in the DevTools panel before the full payload
-    printed, so treat this as CONFIRMED-PRESENT, not CONFIRMED-COMPLETE):
+  - Confirmed "ticker" event fields (CONFIRMED-PRESENT, not necessarily
+    CONFIRMED-COMPLETE -- the captured frame was truncated in the DevTools
+    panel before the full payload printed):
       symbol, bidPrice, bidSize, bidIv, askPrice, askSize, askIv,
-      lastPrice, highPrice24h, lowPrice24h, ... (truncated -- likely
-      continues with markPrice/markIv/greeks/openInterest/volume based on
-      what a usable options ticker needs, but NOT confirmed -- treat any
-      field not in the list above as unconfirmed until independently seen).
+      lastPrice, highPrice24h, lowPrice24h, ...
   - Confirmed "orderBook" event fields (also truncated in capture):
-      {"bids": [[price_str, size_str], [price_str, size_str], ...], ...}
-      "asks" almost certainly exists symmetrically but was cut off in the
-      captured frame -- NOT independently confirmed, treated as probable.
-  - Confirmed "indexPrice" event, FULL payload (this one was short enough
-    to capture completely):
+      {"bids": [[price_str, size_str], ...], ...}  ("asks" assumed symmetric, not independently confirmed)
+  - Confirmed "indexPrice" event, FULL payload:
       {"indexPrice": "77242.1492131", "baseCoin": "BTC", "quoteCoin": "USDT"}
 
-STILL NOT CONFIRMED:
-  - Whether a "subscribe" call is even required. No outgoing subscribe
-    frame was visible in the captured session -- ticker/orderBook/
-    indexPrice events for multiple different strikes were streaming
-    without an observed subscribe emit. Two explanations, both plausible:
-    (a) the subscribe happened before DevTools started recording, or
-    (b) this socket just broadcasts all live options data for the loaded
-    underlying with no per-symbol subscribe step at all. This file emits a
-    "subscribe" event as a reasonable, low-risk attempt (harmless if
-    ignored) but does NOT rely on it being necessary -- the on_ticker
-    handler processes any ticker event received regardless of whether an
-    explicit subscribe was acknowledged.
-  - The Listen Key REST paths for the authenticated fawss-uds-options
-    stream -- see this module's bottom section, still placeholder.
+ZERO-DATA INVESTIGATION (active, 2026-08-24): a live smoke test against
+SHARK_OPTIONS_WS_URL connected successfully and stayed open for 20 seconds,
+but zero ticker/orderBook/indexPrice events arrived, despite subscribing to
+a symbol ("BTC-24AUG26-73000-P-USDT") that was confirmed streaming live
+moments earlier in a real browser session against the same host. Two
+live hypotheses, not yet disambiguated, being tried in order of
+cost-to-test:
+  1. (TRIED THIS REVISION) Origin/Referer header mismatch. Real exchanges
+     commonly gate event PUSH logic on request headers looking like a
+     genuine browser tab, even when the initial handshake/upgrade succeeds
+     regardless of headers (handshake success != authorized to receive
+     data). This revision adds Origin/Referer headers matching a real
+     sharkexchange.in options page to connect() -- see start()'s inline
+     comment. If this alone fixes it, the fix was this cheap.
+  2. (NOT YET TRIED) The "subscribe" event name/payload shape is wrong. No
+     outgoing subscribe frame was ever captured directly -- it's possible
+     the real page sends something differently-named/shaped, or sends it
+     as part of the initial connection (e.g. Socket.IO auth/query
+     payload) rather than as a post-connect emit. If headers alone don't
+     fix it, the next step is a fresh DevTools capture of the EXACT
+     outgoing (upward-arrow) frames sent in the few hundred ms right after
+     a fresh page load's "40{sid:...}" connect ack -- previous captures in
+     this investigation only caught steady-state ping/pong frames, not the
+     initial subscribe (if one exists).
 """
 
 from __future__ import annotations
@@ -112,17 +98,22 @@ logger = logging.getLogger("shark_ws")
 
 MarketSnapshotCallback = Callable[[MarketSnapshot], None]
 
-# CONFIRMED 2026-08-23 via live DevTools Headers capture (Request URL of a
-# real 101 Switching Protocols connection). Replaces the earlier inferred
-# `https://api.sharkexchange.in`, which returned a live 404 -- options
-# market data runs on its own dedicated subdomain, separate from the REST
-# API host and from the futures WS host. See module docstring's BONUS
-# FINDING note for the other three hosts observed alongside this one.
+# CONFIRMED 2026-08-23 via live DevTools Headers capture, RE-CONFIRMED
+# 2026-08-24 via a live successful connection. Replaces the earlier
+# inferred `https://api.sharkexchange.in`, which returned a live 404.
 SHARK_OPTIONS_WS_URL = "https://fawss-options.sharkexchange.in"
 
 # Authenticated counterpart, confirmed to exist (same Headers capture) but
 # not yet wired up -- needs a Listen Key first. See module docstring.
 SHARK_OPTIONS_UDS_WS_URL = "https://fawss-uds-options.sharkexchange.in"
+
+# Matches a real browser tab's headers when loading the BTC options chain.
+# Added 2026-08-24 as the first attempt at fixing the ZERO-DATA
+# INVESTIGATION described in the module docstring -- see start()'s comment.
+_BROWSER_MATCHING_HEADERS = {
+    "Origin": "https://sharkexchange.in",
+    "Referer": "https://sharkexchange.in/options/btcusdt",
+}
 
 
 class SharkWebSocketClient:
@@ -167,7 +158,17 @@ class SharkWebSocketClient:
         # transport=["websocket"] skips the polling handshake step and
         # connects directly via WS -- confirmed acceptable since the real
         # session's Engine.IO open packet advertised "upgrades":["websocket"].
-        self._sio.connect(self._ws_url, transports=["websocket"], wait_timeout=15)
+        #
+        # headers=_BROWSER_MATCHING_HEADERS added 2026-08-24: see module
+        # docstring's ZERO-DATA INVESTIGATION note. A first live test
+        # connected successfully but received zero events; this is attempt
+        # #1 at fixing that (Origin/Referer header gating on server-side
+        # push logic, distinct from handshake-level auth). If a subsequent
+        # test still receives zero events, this is NOT the cause and
+        # attempt #2 (verifying the subscribe shape) is next.
+        self._sio.connect(
+            self._ws_url, transports=["websocket"], wait_timeout=15, headers=_BROWSER_MATCHING_HEADERS
+        )
 
     def stop(self) -> None:
         if self._sio.connected:
@@ -176,10 +177,12 @@ class SharkWebSocketClient:
     def subscribe(self, symbols: list[str]) -> None:
         """
         Emits a "subscribe" event with the given symbols -- see module
-        docstring's caveat that this wasn't confirmed necessary in the
-        captured session. Harmless either way: if Shark ignores this event,
-        ticker/orderBook/indexPrice events still get processed by this
-        client's handlers regardless.
+        docstring's ZERO-DATA INVESTIGATION note: this shape is NOT
+        confirmed, and is the leading suspect if header-matching alone
+        doesn't fix the zero-data issue. Harmless either way: if Shark
+        ignores this event, ticker/orderBook/indexPrice events (if they
+        arrive at all) still get processed by this client's handlers
+        regardless of whether this specific emit was meaningful.
         """
         self._pending_symbols.update(symbols)
         if self._sio.connected:
@@ -200,8 +203,8 @@ class SharkWebSocketClient:
 
     def _send_subscribe(self, symbols: list[str]) -> None:
         # Event name/payload shape here is a reasonable-convention attempt,
-        # NOT confirmed (see module docstring) -- no outgoing subscribe
-        # frame was captured to copy exactly.
+        # NOT confirmed (see module docstring's ZERO-DATA INVESTIGATION) --
+        # no outgoing subscribe frame was captured to copy exactly.
         try:
             self._sio.emit("subscribe", {"symbols": symbols})
             logger.info("Emitted subscribe for %d symbol(s) (shape unconfirmed, see docstring).", len(symbols))
@@ -214,22 +217,9 @@ class SharkWebSocketClient:
             self._on_snapshot(snapshot)
 
     def _on_order_book(self, data: dict) -> None:
-        # Not yet wired into MarketSnapshot -- MarketSnapshot per
-        # normalization/schemas.py is a top-of-book (best_bid/best_ask)
-        # shape, not a full depth shape. Logged at DEBUG for now; revisit
-        # if/when full-depth data is actually needed (e.g. for slippage
-        # modeling -- see backtest/replay.py's KNOWN LIMITATION -- SLIPPAGE
-        # note, which is exactly the kind of thing full depth could help
-        # close eventually).
         logger.debug("orderBook event received (not yet parsed into a snapshot): %r", data)
 
     def _on_index_price(self, data: dict) -> None:
-        # Full confirmed shape: {"indexPrice": ..., "baseCoin": ..., "quoteCoin": ...}
-        # Not currently forwarded anywhere -- collectors/realtime_collector.py
-        # (or equivalent) would need a separate index-price sink, since
-        # MarketSnapshot's underlying_index field is populated per-instrument
-        # in _parse_ticker below, not as its own event stream. Logged for
-        # now so this data isn't silently dropped without a trace.
         logger.debug("indexPrice event received (not yet forwarded): %r", data)
 
     @staticmethod
@@ -242,14 +232,6 @@ class SharkWebSocketClient:
             return None
 
     def _parse_ticker(self, data: dict) -> MarketSnapshot | None:
-        """
-        Field mapping here uses ONLY confirmed-present fields from the real
-        captured frame (see module docstring). Fields not confirmed present
-        (mark_price, greeks, open_interest, volume) are left None rather
-        than guessed at a field name that might not exist -- consistent
-        with this codebase's fail-closed principle elsewhere (e.g.
-        pricing/ev_engine.py's InsufficientDataError).
-        """
         symbol = data.get("symbol")
         if not symbol:
             logger.warning("Shark ticker event missing symbol field, dropping: %r", data)
@@ -264,12 +246,9 @@ class SharkWebSocketClient:
             bid_size=self._dec_or_none(data.get("bidSize")),
             ask_size=self._dec_or_none(data.get("askSize")),
             last_price=self._dec_or_none(data.get("lastPrice")),
-            mark_price=None,  # not confirmed present -- see docstring
-            index_price=None,  # delivered via separate "indexPrice" event, not per-ticker -- see _on_index_price
-            iv=self._dec_or_none(data.get("askIv")),  # using ask-side IV as the confirmed-present IV field;
-                                                        # bidIv also exists but MarketSnapshot has one iv slot --
-                                                        # revisit which side is more appropriate once this is
-                                                        # actually consumed by pricing/ev_engine.py for Shark legs.
+            mark_price=None,
+            index_price=None,
+            iv=self._dec_or_none(data.get("askIv")),
             delta=None,
             gamma=None,
             theta=None,
@@ -284,19 +263,10 @@ class SharkWebSocketClient:
 
 
 # -- Listen Key lifecycle (Authenticated WebSocket, fawss-uds-options) ------
-#
-# PLACEHOLDER PATHS -- not confirmed. Guessed following the Binance/MEXC
-# convention (`/v1/userDataStream` for POST/PUT/DELETE) since Shark's docs
-# sidebar confirms this feature EXISTS (Create/Get/Update/Delete Listen Key
-# are real section headers) but the actual REST paths were never reached in
-# any doc fetch attempt. What IS now confirmed is the destination host to
-# connect to once a listen key is minted: SHARK_OPTIONS_UDS_WS_URL above.
-
 _LISTEN_KEY_PATH_GUESS = "/v1/userDataStream"
 
 
 def create_listen_key(adapter) -> str:
-    """Takes a SharkAdapter (for its signed _post helper) -- PLACEHOLDER path, unconfirmed."""
     resp = adapter._post(_LISTEN_KEY_PATH_GUESS)
     return resp["listenKey"]
 
