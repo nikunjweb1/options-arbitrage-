@@ -54,19 +54,36 @@ Confirmed event #3: "indexPrice" (complete, not truncated)
   option contract -- forcing an index price into that table would mean
   fabricating an option_type/strike that doesn't exist.
 
-OPEN DISCREPANCY, FLAGGED HONESTLY:
-exchange_adapters/shark_ws_capture.py, run via the Python socketio client
-against the same host, received ZERO events over 180s. The browser, on the
-same host, received a continuous stream unprompted. Plausible causes (not
-yet tested): (a) the server checks the Origin/Referer header and the Python
-client didn't send one matching https://sharkexchange.in, (b) the Python
-client's default transport list didn't upgrade to websocket within the
-capture window, (c) some other browser-only signal is required. This client
-sends an explicit Origin header and forces websocket-only transport as an
-attempt to close that gap -- but that fix itself is UNVERIFIED until
-someone runs this against the real host and confirms events arrive. If
-event_counts stays all-zero after start() + wait_until_connected(), check
-that first before debugging further upstream (e.g. in realtime_collector.py).
+CONNECTION FIX HISTORY, FLAGGED HONESTLY (most recent first):
+
+  2026-08-25 -- FIX: transports changed from ["websocket"] to
+  ["polling", "websocket"]. The original browser capture (very first
+  DevTools session in this investigation) shows the real connection
+  sequence is POLLING FIRST -- dozens of `transport=polling` XHR requests
+  establish a session and obtain a `sid`, and only THEN does the client
+  upgrade to `transport=websocket` using that sid. Forcing
+  transports=["websocket"] skips that handshake and connects directly via
+  WS from a cold start. Live-tested 2026-08-24/25 with websocket-only: the
+  connection succeeded at the TCP/TLS/Engine.IO level but then disconnected
+  almost immediately / delivered zero events in the brief time it stayed
+  open -- the well-known Socket.IO server-side pattern of validating that a
+  websocket upgrade references a `sid` already established via a prior
+  polling request, and dropping connections that skip straight to
+  websocket. See _run()'s inline comment for the full reasoning. This fix
+  is UNVERIFIED until re-tested against the real host -- if event_counts
+  stays all-zero (or the connection still drops immediately) after this
+  change, that specific hypothesis was wrong and the next thing to check is
+  whether a Cookie header (real browser session) is required, which neither
+  fix attempt so far has sent.
+
+  2026-08-23/24 -- FIX ATTEMPT: explicit Origin header added
+  (headers={"Origin": self._origin}), attempting to close the gap where an
+  earlier plain-Python capture received zero events but the real browser
+  (which sends this automatically) received a continuous stream. Kept
+  alongside the polling-first fix above since both address different parts
+  of "look like the real browser's connection" -- if only one turns out to
+  matter, the polling-first fix is more likely to be it, per the reasoning
+  above, but there's no cost to keeping both.
 
 RESOLVED, 2026-08-24 (previously an open item in an earlier draft of this
 file): whether the settlement TIME for Shark *options* specifically (not
@@ -308,14 +325,34 @@ class SharkWebSocketClient:
     def _run(self) -> None:
         url = f"https://{self._host}"
         try:
-            # UNVERIFIED FIX (see module docstring OPEN DISCREPANCY): explicit
-            # Origin header + websocket-only transport, attempting to close
-            # the gap where the plain-Python capture got zero events but the
-            # real browser (which sends these automatically) got a
-            # continuous stream.
+            # FIX 2026-08-25 (was: transports=["websocket"]): the real
+            # browser capture (DevTools Network tab, very first capture in
+            # this investigation) shows the actual connection sequence is
+            # POLLING FIRST -- dozens of `transport=polling` XHR requests
+            # establish a session and obtain a `sid`, and only THEN does the
+            # client upgrade to `transport=websocket` using that sid. Forcing
+            # transports=["websocket"] skips that polling handshake and
+            # connects directly via WS from a cold start.
+            #
+            # Live-tested 2026-08-24/25: with websocket-only, the connection
+            # succeeded (TCP/TLS/Engine.IO handshake all completed) but then
+            # disconnected almost immediately, and/or delivered zero events
+            # during the brief time it stayed open. This is the well-known
+            # Socket.IO server-side pattern of validating that a websocket
+            # upgrade request references a `sid` already established via a
+            # prior polling request -- a from-scratch direct-to-websocket
+            # connect looks anomalous and gets dropped, even though the
+            # initial handshake response looks fine.
+            #
+            # This was tried BEFORE the Origin-header fix (see module
+            # docstring's CONNECTION FIX HISTORY) and is a separate, likely
+            # more fundamental cause of the same symptom -- both fixes are
+            # kept together since they address different parts of "look
+            # like the real browser's connection", but if only one turns
+            # out to matter, it's more likely this one.
             self._sio.connect(
                 url,
-                transports=["websocket"],
+                transports=["polling", "websocket"],
                 headers={"Origin": self._origin},
                 wait_timeout=15,
             )
