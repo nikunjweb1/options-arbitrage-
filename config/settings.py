@@ -12,6 +12,17 @@ module. If the other working session has a different real version of this file
 locally, diff before assuming this reconstruction is authoritative -- the goal
 here is "unblock the pipeline correctly", not "win a merge conflict".
 
+COMPATIBILITY FIX 2026-08-25: the 2026-08-24 reconstruction above introduced
+`DeltaConfig.base_url` and `CollectorConfig.max_retries`/`retry_backoff_sec`,
+but exchange_adapters/delta.py -- the original, tested Phase 2 adapter,
+unchanged since before this reconstruction -- was written against
+`rest_base_url`/`max_retries_per_call`/`retry_backoff_base_sec`. Running
+delta.py against the reconstructed config raised
+`AttributeError: 'DeltaConfig' object has no attribute 'rest_base_url'`.
+Fixed by adding the old names as aliases alongside the new ones, rather than
+picking a winner and breaking whichever side of this hadn't been tested yet
+in this session.
+
 Loads from config/.env if present (via python-dotenv, already a dependency per
 requirements.txt), falling back to hardcoded defaults below -- never raises on
 a missing .env file, since SCAN_ONLY mode should work with zero configuration.
@@ -158,6 +169,13 @@ class DeltaConfig:
             else "https://api.india.delta.exchange"
         )
 
+    @property
+    def rest_base_url(self) -> str:
+        """Alias for base_url -- see module docstring's 2026-08-25
+        COMPATIBILITY FIX note. exchange_adapters/delta.py expects this
+        exact name."""
+        return self.base_url
+
 
 DELTA = DeltaConfig(
     use_testnet=_env_bool("DELTA_USE_TESTNET", True),
@@ -209,6 +227,18 @@ class CollectorConfig:
     max_retries: int
     retry_backoff_sec: float
     log_path: Path
+
+    @property
+    def max_retries_per_call(self) -> int:
+        """Alias for max_retries -- see module docstring's 2026-08-25
+        COMPATIBILITY FIX note. exchange_adapters/delta.py expects this
+        exact name."""
+        return self.max_retries
+
+    @property
+    def retry_backoff_base_sec(self) -> float:
+        """Alias for retry_backoff_sec -- same reason as max_retries_per_call above."""
+        return self.retry_backoff_sec
 
 
 COLLECTOR = CollectorConfig(
