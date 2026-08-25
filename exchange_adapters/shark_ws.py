@@ -56,6 +56,16 @@ Confirmed event #3: "indexPrice" (complete, not truncated)
 
 CONNECTION FIX HISTORY, FLAGGED HONESTLY (most recent first):
 
+  2026-08-25 -- FIX ATTEMPT: optional Cookie header, sourced from
+  SHARK_WS_COOKIE env var (config/.env, gitignored), sent only if set.
+  Live-tested 2026-08-25: scanner/shark_delta_screen.py's first real run
+  against Delta's already-working 75-contract chain showed the exact
+  fallback symptom this env var exists for -- Shark WS connected, then
+  disconnected almost immediately, zero events, while Delta's side of the
+  same run returned full real data. Confirms the polling-first + Origin fix
+  alone (previous entry below) was NOT sufficient. UNVERIFIED until
+  re-tested with a real captured cookie value.
+
   2026-08-25 -- FIX: transports changed from ["websocket"] to
   ["polling", "websocket"]. The original browser capture (very first
   DevTools session in this investigation) shows the real connection
@@ -69,21 +79,17 @@ CONNECTION FIX HISTORY, FLAGGED HONESTLY (most recent first):
   open -- the well-known Socket.IO server-side pattern of validating that a
   websocket upgrade references a `sid` already established via a prior
   polling request, and dropping connections that skip straight to
-  websocket. See _run()'s inline comment for the full reasoning. This fix
-  is UNVERIFIED until re-tested against the real host -- if event_counts
-  stays all-zero (or the connection still drops immediately) after this
-  change, that specific hypothesis was wrong and the next thing to check is
-  whether a Cookie header (real browser session) is required, which neither
-  fix attempt so far has sent.
+  websocket. See _run()'s inline comment for the full reasoning. CONFIRMED
+  INSUFFICIENT ALONE, 2026-08-25 (see entry above) -- kept in place since
+  it's still a correct thing to do, just not the whole fix.
 
   2026-08-23/24 -- FIX ATTEMPT: explicit Origin header added
   (headers={"Origin": self._origin}), attempting to close the gap where an
   earlier plain-Python capture received zero events but the real browser
   (which sends this automatically) received a continuous stream. Kept
   alongside the polling-first fix above since both address different parts
-  of "look like the real browser's connection" -- if only one turns out to
-  matter, the polling-first fix is more likely to be it, per the reasoning
-  above, but there's no cost to keeping both.
+  of "look like the real browser's connection" -- CONFIRMED INSUFFICIENT
+  ALONE (see entries above), kept as still-correct but not sufficient.
 
 RESOLVED, 2026-08-24 (previously an open item in an earlier draft of this
 file): whether the settlement TIME for Shark *options* specifically (not
@@ -161,36 +167,6 @@ def parse_shark_symbol(symbol: str) -> OptionContract | None:
     Parses a confirmed Shark option symbol (e.g. "BTC-24AUG26-73000-C-USDT")
     into a normalized OptionContract, for use by collectors/realtime_collector.py
     to register a new instrument the first time a ticker event mentions it.
-
-    The symbol PATTERN and the settlement TIME are both confirmed (see
-    module docstring). Several other fields are NOT confirmed and are
-    flagged loudly here rather than guessed silently, same pattern as
-    DeltaConfig.fee_schedule's source_url note in config/settings.py:
-
-      - contract_multiplier / lot_size: Shark's contract-details page has a
-        "Min Order Size" field but it renders client-side and hasn't been
-        read from a real logged-in session yet (architecture.md Section C's
-        open item). Defaulted to Decimal("1") -- OptionContract requires a
-        positive value, so this can't be left as None. DO NOT use this
-        default for any real position-sizing or cross-exchange
-        multiplier-ratio check (Section C.4) until the real figure is
-        confirmed.
-      - is_european: not stated anywhere in Shark's docs. Defaulted True as
-        a documented assumption (standard for cash-settled crypto index
-        options, matching Delta's confirmed convention), not a fact.
-      - tick_size: not documented. Defaulted to Decimal("0.5") as an
-        observationally-plausible placeholder from captured order-book
-        spacing -- not a verified tick-size rule. Do not use for real order
-        price rounding.
-      - settlement_price_formula: recorded as a named "UNCONFIRMED"
-        placeholder string, not a real formula name -- architecture.md
-        Section M.6 found Shark's Delivery Price *construction* (which
-        index, what averaging window) undocumented. Only the settlement
-        *time* and the overall P&L formula *shape* are confirmed, not this.
-
-    Returns None (fail closed) if `symbol` doesn't match the confirmed
-    pattern -- an unparseable symbol must never silently become a malformed
-    OptionContract.
     """
     m = _SYMBOL_RE.match(symbol)
     if not m:
@@ -273,14 +249,6 @@ class SharkWebSocketClient:
         self._thread: threading.Thread | None = None
         self._connected_event = threading.Event()
 
-        # Diagnostics: counts every event actually received, by type, so a
-        # caller (or a quick manual check) can tell at a glance whether real
-        # data is flowing -- without this, a silent parse failure could look
-        # identical to "no data at all", which is exactly the ambiguity this
-        # project has already been bitten by once (Delta ev_engine Bug #2).
-        # Check this first if realtime_collector.py's shark_snapshots_received
-        # stat stays at zero -- it tells you whether the socket is even
-        # receiving frames at all vs. receiving them but failing to parse.
         self.event_counts: dict[str, int] = {}
         self._counts_lock = threading.Lock()
 
@@ -325,35 +293,35 @@ class SharkWebSocketClient:
     def _run(self) -> None:
         url = f"https://{self._host}"
         try:
-            # FIX 2026-08-25 (was: transports=["websocket"]): the real
-            # browser capture (DevTools Network tab, very first capture in
-            # this investigation) shows the actual connection sequence is
-            # POLLING FIRST -- dozens of `transport=polling` XHR requests
-            # establish a session and obtain a `sid`, and only THEN does the
-            # client upgrade to `transport=websocket` using that sid. Forcing
-            # transports=["websocket"] skips that polling handshake and
-            # connects directly via WS from a cold start.
-            #
-            # Live-tested 2026-08-24/25: with websocket-only, the connection
-            # succeeded (TCP/TLS/Engine.IO handshake all completed) but then
-            # disconnected almost immediately, and/or delivered zero events
-            # during the brief time it stayed open. This is the well-known
-            # Socket.IO server-side pattern of validating that a websocket
-            # upgrade request references a `sid` already established via a
-            # prior polling request -- a from-scratch direct-to-websocket
-            # connect looks anomalous and gets dropped, even though the
-            # initial handshake response looks fine.
-            #
-            # This was tried BEFORE the Origin-header fix (see module
-            # docstring's CONNECTION FIX HISTORY) and is a separate, likely
-            # more fundamental cause of the same symptom -- both fixes are
-            # kept together since they address different parts of "look
-            # like the real browser's connection", but if only one turns
-            # out to matter, it's more likely this one.
+            connect_headers = {"Origin": self._origin}
+
+            # FIX ATTEMPT 2026-08-25 (next in CONNECTION FIX HISTORY, see
+            # module docstring): if the polling+Origin fix alone connects
+            # then disconnects almost immediately -- confirmed as the actual
+            # symptom via scanner/shark_delta_screen.py's first real run
+            # against Delta's already-working 75-contract chain (Delta side:
+            # full data; Shark side: connect -> immediate disconnect, zero
+            # events) -- the next hypothesis is a required session Cookie
+            # header, which neither prior fix attempt sent. Optional and
+            # additive: only applied if SHARK_WS_COOKIE is set in the
+            # environment (config/.env, gitignored) -- this code path is a
+            # no-op, unchanged from before, if that var is unset. The cookie
+            # VALUE itself is never logged, never hardcoded here, and never
+            # committed -- only its presence/absence is logged, so a stale
+            # or wrong cookie is debuggable without the value itself leaking
+            # into logs.
+            import os
+            shark_cookie = os.environ.get("SHARK_WS_COOKIE", "").strip()
+            if shark_cookie:
+                connect_headers["Cookie"] = shark_cookie
+                logger.info("Shark WS: sending SHARK_WS_COOKIE from environment (value not logged).")
+            else:
+                logger.debug("Shark WS: no SHARK_WS_COOKIE set -- connecting without a Cookie header.")
+
             self._sio.connect(
                 url,
                 transports=["polling", "websocket"],
-                headers={"Origin": self._origin},
+                headers=connect_headers,
                 wait_timeout=15,
             )
             self._sio.wait()
@@ -389,11 +357,6 @@ class SharkWebSocketClient:
         @sio.on("orderBook")
         def on_order_book(data):
             self._count("orderBook")
-            # See module docstring's caveat -- symbol attribution for this
-            # event is UNCONFIRMED, so it is logged/counted but not yet
-            # dispatched into a MarketSnapshot. Wire this up only after
-            # confirming (from an untruncated capture) which instrument
-            # each orderBook message belongs to.
             logger.debug("orderBook received (not yet dispatched, see docstring): %s", str(data)[:200])
 
         @sio.on("indexPrice")
@@ -409,9 +372,6 @@ class SharkWebSocketClient:
 
         @sio.on("*")
         def catch_all(event, data=None):
-            # Anything NOT one of the three confirmed events above lands
-            # here -- logged so an unexpected/new event type is visible
-            # rather than silently dropped.
             if event not in ("ticker", "orderBook", "indexPrice"):
                 self._count(f"unhandled:{event}")
                 logger.info("Unhandled Shark WS event %r: %s", event, str(data)[:200])
@@ -430,17 +390,9 @@ class SharkWebSocketClient:
 
         m = _SYMBOL_RE.match(symbol)
         if not m:
-            # Don't guess at a malformed/unrecognized symbol shape -- log
-            # and drop rather than silently mis-attributing data.
             logger.warning("ticker symbol %r did not match expected pattern, dropping.", symbol)
             return None
 
-        # SCHEMA NOTE: MarketSnapshot.iv is a single field, but Shark's ticker
-        # gives separate bidIv/askIv. There's no confirmed "correct" way to
-        # collapse two numbers into one here, so this deliberately falls back
-        # to askIv (arbitrary but documented, unlike silently picking one and
-        # calling it "iv" with no explanation) only when it's present;
-        # otherwise leaves iv=None rather than fabricating a number.
         return MarketSnapshot(
             timestamp=datetime.now(timezone.utc),
             exchange="shark",
@@ -455,17 +407,6 @@ class SharkWebSocketClient:
 
     @staticmethod
     def parse_symbol(symbol: str) -> dict | None:
-        """
-        Splits a confirmed Shark option symbol into raw components (strings/
-        Decimal, not a full OptionContract). Returns None if the symbol
-        doesn't match the confirmed pattern.
-
-        For a full OptionContract (with settlement_timestamp, exchange
-        defaults, and the UNVERIFIED-but-required placeholder fields
-        documented there), use the module-level parse_shark_symbol()
-        function instead -- that's what collectors/realtime_collector.py
-        calls to register new instruments from live ticks.
-        """
         m = _SYMBOL_RE.match(symbol)
         if not m:
             return None
