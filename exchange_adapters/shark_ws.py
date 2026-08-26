@@ -8,119 +8,114 @@ an order. Duplicated from shark_ws_capture.py's host-refusal rule rather than
 imported, so this file's safety property doesn't depend on another file
 staying correct.
 
-STATUS AS OF 2026-08-23 -- CONFIRMED AGAINST REAL DATA:
+CORRECTION, 2026-08-26 -- THE EARLIER "FIRE HOSE, NO SUBSCRIBE NEEDED"
+CLAIM IN THIS DOCSTRING WAS WRONG. Stated here plainly rather than silently
+edited away, since acting on that wrong claim is exactly why every prior
+"zero events received" debugging round (see CONNECTION FIX HISTORY below)
+went looking at headers/transport/cookies instead of the actual cause. The
+original capture that led to that claim happened to start recording
+mid-session, after the browser had already sent its subscribe calls --
+so no outgoing subscribe frame was visible, and the (wrong) conclusion was
+that none existed. A fresh capture starting DevTools recording BEFORE
+navigating to the page (2026-08-26) caught the real sequence:
+
+    -> 42["subscribe",{"params":["BTC_USDT@indexPrice","ETH_USDT@indexPrice"]}]
+    <- 42["indexPrice",{"indexPrice":"78929.55636322","baseCoin":"BTC","quoteCoin":"USDT"}]
+    -> 42["unsubscribe",{"params":[""]}]
+    -> 42["subscribe",{"params":["BTC_USDT_27AUG26@ticker"]}]
+    <- 42["ticker",{"symbol":"BTC-27AUG26-78750-C-USDT","bidPrice":"690",...}]
+
+CONFIRMED subscribe protocol, replacing the old claim entirely:
+  - Event name: "subscribe" (and "unsubscribe" with the same param shape).
+  - Payload shape: {"params": [<channel string>, ...]} -- an array, so one
+    call can subscribe multiple channels at once (the indexPrice example
+    above subscribes BTC and ETH in a single call).
+  - Index price channel format: "{BASE}_{QUOTE}@indexPrice"
+    e.g. "BTC_USDT@indexPrice"
+  - Ticker channel format: "{BASE}_{QUOTE}_{EXPIRY:DDMMMYY}@ticker"
+    e.g. "BTC_USDT_27AUG26@ticker"
+    IMPORTANT: this is PER-EXPIRY, not per-strike or per-contract. A single
+    subscribe to one expiry's ticker channel streams ticker events for
+    EVERY strike and both option types (C and P) at that expiry -- this is
+    why earlier captures showed many different strikes streaming from what
+    looked like one connection: it was one subscription, not many. This
+    also means subscribing is cheap: one call per expiry date you care
+    about covers the whole chain for that date, not one call per contract.
+
+STATUS AS OF 2026-08-23/26 -- CONFIRMED AGAINST REAL DATA:
 Event names and payload shapes below are confirmed -- captured via Chrome
 DevTools Network -> WS -> Messages tab on a real, logged-in session at
 https://sharkexchange.in/options/btcusdt, connected to
-wss://fawss-options.sharkexchange.in/socket.io/ with transport=websocket
-(the actual upgraded connection, not the polling fallback).
-
-Three real Socket.IO event names were observed, unprompted -- no subscribe
-message was sent by the browser before data arrived. This is a "fire hose"
-feed: connecting appears to be sufficient to receive updates for many/all
-option contracts at once, not just ones explicitly subscribed to. (This is
-DIFFERENT from delta_ws.py, which does require an explicit channel
-subscribe -- don't assume the two adapters work identically here.)
+wss://fawss-options.sharkexchange.in/socket.io/.
 
 Confirmed event #1: "ticker"
-  42["ticker",{"symbol":"BTC-24AUG26-86000-C-USDT","bidPrice":"0",
-    "bidSize":"0","bidIv":"0","askPrice":"5","askSize":"34.69",
-    "askIv":"1.0268","lastPrice":"5","highPrice24h":"35",
-    "lowPrice24h":"5", ...}]
-  The captured frame was truncated by DevTools display (~580-640 chars
-  shown, actual message may be longer) -- fields after lowPrice24h are
-  UNKNOWN and not parsed below. Do not guess at them.
+  42["ticker",{"symbol":"BTC-27AUG26-78750-C-USDT","bidPrice":"690",
+    "bidSize":"4","bidIv":"0.3661","askPrice":"695","askSize":"3.91",
+    "askIv":"0.3692","lastPrice":"690","highPrice24h":"1710", ...}]
+  Field list below is CONFIRMED-PRESENT, not necessarily CONFIRMED-COMPLETE
+  -- the captured frame was truncated by the DevTools display before the
+  full payload printed.
 
   Symbol format (confirmed from multiple examples):
     {BASE}-{EXPIRY:DDMMMYY}-{STRIKE}-{C|P}-{QUOTE}
-    e.g. "BTC-24AUG26-86000-C-USDT" -> BTC, 24 Aug 2026, strike 86000, Call, USDT
+    e.g. "BTC-27AUG26-78750-C-USDT" -> BTC, 27 Aug 2026, strike 78750, Call, USDT
 
 Confirmed event #2: "orderBook"
-  42["orderBook",{"bids":[["560","1.68"],["555","1.65"],["550","4.11"],...]}]
-  IMPORTANT CAVEAT: the captured frame shows a "bids" key but was truncated
-  before any "asks" key (if present) became visible. It's also UNCONFIRMED
-  whether this message includes a "symbol" field further in (truncated) or
-  whether it implicitly refers to whatever contract the page currently has
-  selected. This event is therefore counted (see event_counts) but
-  deliberately NOT dispatched into a MarketSnapshot -- wire it up only after
-  a full, untruncated capture confirms both of these.
+  42["orderBook",{"bids":[["560","1.68"],["555","1.65"],...]}]
+  Same caveat as before: "asks" key and symbol attribution for this event
+  remain UNCONFIRMED (truncated in every capture so far) -- counted but not
+  yet dispatched into a MarketSnapshot.
 
 Confirmed event #3: "indexPrice" (complete, not truncated)
-  42["indexPrice",{"indexPrice":"77242.1492131","baseCoin":"BTC","quoteCoin":"USDT"}]
-  This is a market-wide index value, not per-instrument -- exposed via a
-  separate callback (on_index_price), not folded into MarketSnapshot. It
-  isn't an option instrument (no strike/expiry/type), and db/schema.sql's
-  `instruments` table has CHECK constraints that assume every row is a real
-  option contract -- forcing an index price into that table would mean
-  fabricating an option_type/strike that doesn't exist.
+  42["indexPrice",{"indexPrice":"78929.55636322","baseCoin":"BTC","quoteCoin":"USDT"}]
+  Market-wide, not per-instrument -- exposed via a separate callback
+  (on_index_price), not folded into MarketSnapshot, since db/schema.sql's
+  `instruments` table assumes every row is a real option contract.
 
 CONNECTION FIX HISTORY, FLAGGED HONESTLY (most recent first):
+
+  2026-08-26 -- ROOT CAUSE FOUND AND FIXED: see CORRECTION at the top of
+  this docstring. Every "zero events" symptom in every entry below this one
+  was, in hindsight, this same root cause -- no subscribe call was ever
+  being sent, at any point, by this client's earlier versions. The
+  Cookie-header and handle_sigint fixes below were real, correctly-reasoned
+  fixes for real, separate problems they each targeted (see their own
+  entries), but neither of them was ever going to fix the zero-events
+  symptom, because that symptom's actual cause was simpler than any of the
+  hypotheses being tested for it.
 
   2026-08-26 -- FIX: added handle_sigint=False to the socketio.Client()
   constructor. Root cause, confirmed against a real crash on a Windows end-
   user run of scanner/shark_delta_screen.py: python-socketio's Client
   installs its own SIGINT handler by default, which assumes it owns the
   main thread via a foreground sio.wait() call. This client instead runs
-  sio.wait() inside a background thread (_run(), below) while the caller's
-  main thread does its own time.sleep() -- exactly the "running the Client
-  in a thread" scenario python-socketio's own maintainer confirmed causes a
-  synthesized KeyboardInterrupt on disconnect/reconnect, even with no real
-  Ctrl+C pressed (github.com/miguelgrinberg/python-socketio issues #414 and
-  #453 -- matching traceback shape: socketio/engineio's signal_handler ->
-  original_signal_handler -> KeyboardInterrupt). Because KeyboardInterrupt
-  is a BaseException, not an Exception, it was NOT caught by this file's or
-  shark_delta_screen.py's `except Exception` blocks, so it crashed the
-  entire scan instead of triggering the intended "log a warning, continue
-  with REST-only" fallback. This is a real, separate bug from the
-  connection-itself issues logged below -- it made even a REAL disconnect
-  (from any cause) crash the whole script rather than degrade gracefully,
-  which is the opposite of what shark_delta_screen.py's design intends.
+  sio.wait() inside a background thread while the caller's main thread does
+  its own time.sleep() -- exactly the "running the Client in a thread"
+  scenario python-socketio's own maintainer confirmed causes a synthesized
+  KeyboardInterrupt on disconnect/reconnect (github.com/miguelgrinberg/
+  python-socketio issues #414 and #453). This was a REAL, separate bug from
+  the zero-events issue -- kept, still correct.
 
   2026-08-25 -- FIX ATTEMPT: optional Cookie header, sourced from
-  SHARK_WS_COOKIE env var (config/.env, gitignored), sent only if set.
-  Live-tested 2026-08-25: scanner/shark_delta_screen.py's first real run
-  against Delta's already-working 75-contract chain showed the exact
-  fallback symptom this env var exists for -- Shark WS connected, then
-  disconnected almost immediately, zero events, while Delta's side of the
-  same run returned full real data. Confirms the polling-first + Origin fix
-  alone (previous entry below) was NOT sufficient. UNVERIFIED until
-  re-tested with a real captured cookie value.
+  SHARK_WS_COOKIE env var. Kept in place (harmless, additive, opt-in) even
+  though the actual zero-events cause turned out to be the missing
+  subscribe call, not a missing cookie -- a required cookie is still a
+  plausible requirement for some OTHER purpose (e.g. rate-limit
+  attribution) that just wasn't the thing breaking this particular symptom.
 
   2026-08-25 -- FIX: transports changed from ["websocket"] to
-  ["polling", "websocket"]. The original browser capture (very first
-  DevTools session in this investigation) shows the real connection
-  sequence is POLLING FIRST -- dozens of `transport=polling` XHR requests
-  establish a session and obtain a `sid`, and only THEN does the client
-  upgrade to `transport=websocket` using that sid. Forcing
-  transports=["websocket"] skips that handshake and connects directly via
-  WS from a cold start. Live-tested 2026-08-24/25 with websocket-only: the
-  connection succeeded at the TCP/TLS/Engine.IO level but then disconnected
-  almost immediately / delivered zero events in the brief time it stayed
-  open -- the well-known Socket.IO server-side pattern of validating that a
-  websocket upgrade references a `sid` already established via a prior
-  polling request, and dropping connections that skip straight to
-  websocket. See _run()'s inline comment for the full reasoning. CONFIRMED
-  INSUFFICIENT ALONE, 2026-08-25 (see entry above) -- kept in place since
-  it's still a correct thing to do, just not the whole fix.
+  ["polling", "websocket"], matching the real browser's connection
+  sequence. Kept -- still correct, still needed for a stable connection,
+  just not sufficient by itself for receiving data (see CORRECTION above).
 
-  2026-08-23/24 -- FIX ATTEMPT: explicit Origin header added
-  (headers={"Origin": self._origin}), attempting to close the gap where an
-  earlier plain-Python capture received zero events but the real browser
-  (which sends this automatically) received a continuous stream. Kept
-  alongside the polling-first fix above since both address different parts
-  of "look like the real browser's connection" -- CONFIRMED INSUFFICIENT
-  ALONE (see entries above), kept as still-correct but not sufficient.
+  2026-08-23/24 -- FIX ATTEMPT: explicit Origin header. Kept -- still
+  correct, still not sufficient by itself.
 
-RESOLVED, 2026-08-24 (previously an open item in an earlier draft of this
-file): whether the settlement TIME for Shark *options* specifically (not
-just futures/spot) is confirmed. It is -- architecture.md Section M.6
-records this as read directly off Shark's own options contract-details page
-("Delivery Time: 01:30 PM"), not a futures/spot page and not inferred by
-analogy. parse_shark_symbol() below uses that confirmed value (08:00 UTC)
-when building each OptionContract's settlement_timestamp. What remains
-genuinely unconfirmed is the Delivery Price *construction* (which index,
-what averaging window) -- a different question from the settlement clock --
-see parse_shark_symbol's own docstring and architecture.md Section M.6.
+RESOLVED, 2026-08-24: Shark options settlement TIME is confirmed (01:30 PM
+IST / 08:00 UTC) -- architecture.md Section M.6, read directly off Shark's
+own options contract-details page. What remains unconfirmed is the
+Delivery Price *construction* (which index, what averaging window) -- see
+parse_shark_symbol's docstring.
 
 Usage:
     pip install "python-socketio[client]" --break-system-packages
@@ -237,12 +232,33 @@ def parse_shark_symbol(symbol: str) -> OptionContract | None:
     )
 
 
+def format_ticker_channel(base_coin: str, quote_coin: str, expiry_ddmmmyy: str) -> str:
+    """
+    Builds a confirmed ticker-channel string, e.g. format_ticker_channel(
+    "BTC", "USDT", "27AUG26") -> "BTC_USDT_27AUG26@ticker". expiry_ddmmmyy
+    must already be in Shark's DDMMMYY format (e.g. "27AUG26") -- this
+    function does not reformat a date object, since the caller (typically
+    working from a Delta expiry or a manual date) is responsible for
+    knowing which calendar date it means; silently reformatting here risks
+    an off-by-one-day bug being invisible at the call site.
+    """
+    return f"{base_coin.upper()}_{quote_coin.upper()}_{expiry_ddmmmyy.upper()}@ticker"
+
+
+def format_index_price_channel(base_coin: str, quote_coin: str) -> str:
+    """Builds a confirmed index-price-channel string, e.g.
+    format_index_price_channel("BTC", "USDT") -> "BTC_USDT@indexPrice"."""
+    return f"{base_coin.upper()}_{quote_coin.upper()}@indexPrice"
+
+
 class SharkWebSocketClient:
     """
     Public-data-only WebSocket client for Shark Exchange options.
 
     Parses the three confirmed event types (ticker, orderBook, indexPrice).
-    See module docstring for exactly what is and isn't confirmed about each.
+    Requires an explicit subscribe call per channel -- see subscribe_ticker()/
+    subscribe_index_price() below and the module docstring's CORRECTION for
+    why this wasn't always known to be necessary.
     """
 
     def __init__(
@@ -269,6 +285,14 @@ class SharkWebSocketClient:
         self._thread: threading.Thread | None = None
         self._connected_event = threading.Event()
 
+        # Channels requested via subscribe_ticker()/subscribe_index_price()
+        # before a connection exists (or across a reconnect) are queued here
+        # and (re-)sent once connected -- see _on_connect below. Without
+        # this, calling subscribe_ticker() before wait_until_connected()
+        # returns True would silently do nothing.
+        self._pending_channels: set[str] = set()
+        self._pending_lock = threading.Lock()
+
         self.event_counts: dict[str, int] = {}
         self._counts_lock = threading.Lock()
 
@@ -293,27 +317,6 @@ class SharkWebSocketClient:
             reconnection_attempts=self._reconnect_max_attempts,
             reconnection_delay=self._reconnect_backoff_base,
             reconnection_delay_max=self._reconnect_backoff_max,
-            # FIX 2026-08-26, confirmed against a real crash on Windows
-            # (scanner/shark_delta_screen.py's first real end-user run):
-            # python-socketio's Client installs its own SIGINT handler by
-            # default (handle_sigint=True), which assumes it owns the main
-            # thread via a foreground sio.wait() call. This client instead
-            # runs sio.wait() inside a background thread (_run(), below)
-            # while the caller's main thread does its own time.sleep() --
-            # exactly the "Client in a thread" scenario the library's own
-            # maintainer confirmed causes a synthesized KeyboardInterrupt to
-            # surface in the main thread on disconnect/reconnect, even with
-            # no real Ctrl+C pressed (github.com/miguelgrinberg/python-
-            # socketio issues #414 and #453 -- same traceback shape:
-            # socketio/engineio's signal_handler -> original_signal_handler
-            # -> KeyboardInterrupt). Because KeyboardInterrupt is a
-            # BaseException, not an Exception, it was NOT caught by this
-            # file's or shark_delta_screen.py's `except Exception` blocks,
-            # so it crashed the entire scan instead of triggering the
-            # intended "log a warning, continue with REST-only" fallback.
-            # handle_sigint=False tells python-socketio "I'm managing
-            # threading myself" -- the documented, maintainer-endorsed fix
-            # for exactly this usage pattern.
             handle_sigint=False,
         )
         self._register_handlers()
@@ -330,6 +333,36 @@ class SharkWebSocketClient:
     def wait_until_connected(self, timeout_sec: float = 15.0) -> bool:
         return self._connected_event.wait(timeout=timeout_sec)
 
+    def subscribe_ticker(self, base_coin: str, quote_coin: str, expiry_ddmmmyy: str) -> None:
+        """
+        Subscribes to ALL strikes/types for one expiry date -- see module
+        docstring's CONFIRMED subscribe protocol note on why this is
+        per-expiry, not per-contract. Safe to call before the connection is
+        established (queued, see _pending_channels) or after (sent
+        immediately).
+        """
+        channel = format_ticker_channel(base_coin, quote_coin, expiry_ddmmmyy)
+        self._subscribe_channel(channel)
+
+    def subscribe_index_price(self, base_coin: str, quote_coin: str) -> None:
+        channel = format_index_price_channel(base_coin, quote_coin)
+        self._subscribe_channel(channel)
+
+    def _subscribe_channel(self, channel: str) -> None:
+        with self._pending_lock:
+            self._pending_channels.add(channel)
+        if self._sio is not None and self._sio.connected:
+            self._send_subscribe([channel])
+
+    def _send_subscribe(self, channels: list[str]) -> None:
+        # CONFIRMED shape, per module docstring: event "subscribe", payload
+        # {"params": [...]}.
+        try:
+            self._sio.emit("subscribe", {"params": channels})
+            logger.info("Subscribed to %d Shark channel(s): %s", len(channels), channels)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Shark subscribe emit failed for %s: %s", channels, exc)
+
     # -- internal: connection lifecycle ----------------------------------
 
     def _run(self) -> None:
@@ -337,21 +370,6 @@ class SharkWebSocketClient:
         try:
             connect_headers = {"Origin": self._origin}
 
-            # FIX ATTEMPT 2026-08-25 (next in CONNECTION FIX HISTORY, see
-            # module docstring): if the polling+Origin fix alone connects
-            # then disconnects almost immediately -- confirmed as the actual
-            # symptom via scanner/shark_delta_screen.py's first real run
-            # against Delta's already-working 75-contract chain (Delta side:
-            # full data; Shark side: connect -> immediate disconnect, zero
-            # events) -- the next hypothesis is a required session Cookie
-            # header, which neither prior fix attempt sent. Optional and
-            # additive: only applied if SHARK_WS_COOKIE is set in the
-            # environment (config/.env, gitignored) -- this code path is a
-            # no-op, unchanged from before, if that var is unset. The cookie
-            # VALUE itself is never logged, never hardcoded here, and never
-            # committed -- only its presence/absence is logged, so a stale
-            # or wrong cookie is debuggable without the value itself leaking
-            # into logs.
             import os
             shark_cookie = os.environ.get("SHARK_WS_COOKIE", "").strip()
             if shark_cookie:
@@ -378,6 +396,15 @@ class SharkWebSocketClient:
         def connect():
             logger.info("Shark WebSocket connected to %s", self._host)
             self._connected_event.set()
+            # Re-send every requested channel on (re)connect -- covers both
+            # the first connection and any reconnect after a drop, so a
+            # caller's earlier subscribe_ticker()/subscribe_index_price()
+            # calls survive a disconnect without needing to be repeated by
+            # hand.
+            with self._pending_lock:
+                channels = list(self._pending_channels)
+            if channels:
+                self._send_subscribe(channels)
 
         @sio.event
         def connect_error(data):
