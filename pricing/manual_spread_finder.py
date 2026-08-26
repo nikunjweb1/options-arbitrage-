@@ -2,27 +2,48 @@
 CLI: finds the best manually-tradeable cross-exchange calendar spread.
 
 WHY THIS EXISTS: as of 2026-08-24, neither Shark's market-data WebSocket
-(exchange_adapters/shark_ws.py -- connects, but zero events arrive, an
-active unresolved bug) nor a CoinSwitch adapter of any kind exist yet. A
-fully-automated cross-exchange scanner has nothing real to read on the short
--leg side. But the underlying strategy doesn't require automation to be
-tradeable -- the source video this project is based on shows a human doing
-exactly this by eye: watch Shark/CoinSwitch's own website for a strike's
-price, watch Delta's chain for the same strike, and act if the spread looks
-good. This script is that same workflow, minus the arithmetic and
-same-strike-hunting -- you paste in what you're already looking at on
-Shark/CoinSwitch's website, and this pulls Delta's live matching side
-automatically and does the net-credit math for every strike you give it,
+(exchange_adapters/shark_ws.py -- connects, but data reliability is still
+being fixed, see that file's CONNECTION FIX HISTORY) nor a CoinSwitch
+adapter of any kind exist yet. A fully-automated cross-exchange scanner has
+nothing real to read on the short-leg side. But the underlying strategy
+doesn't require automation to be tradeable -- the source video this project
+is based on shows a human doing exactly this by eye: watch Shark/CoinSwitch's
+own website for a strike's price, watch Delta's chain for the same strike,
+and act if the spread looks good. This script is that same workflow, minus
+the arithmetic and same-strike-hunting -- you paste in what you're already
+looking at on Shark/CoinSwitch's website, and this pulls Delta's live
+matching side automatically and does the net-credit math (now also: fees,
+liquidity, and an Indian VDA tax estimate) for every strike you give it,
 instantly, correctly, every time -- computer-check rather than
 computer-execute.
 
 This script places no orders and has no execution path. It is a
-recommendation report for a human to act on manually, matching where this
-project actually is: pipeline proven end-to-end on Delta-only data
-(pricing/run_pricing.py), but the real edge (per docs/architecture.md's own
-Section D.5 analysis and this session's live run showing 92/92 Delta-only
-same-exchange calendar spreads are net-debit) requires a genuine
-cross-exchange IV difference, which needs a second exchange's real quote.
+recommendation report for a human to act on manually.
+
+PIVOT, 2026-08-26: results now PERSIST to the `manual_recommendations`
+table (see db/schema.sql) instead of only printing to a terminal, so the
+dashboard (dashboard/backend/app.py) can serve them -- this is the point
+where "run a script and read the terminal" becomes "check the website
+before you trade." Every recommendation this script computes gets written,
+not just the ones that clear the net-credit bar -- so the dashboard can
+show "we checked X, none were good enough" as honestly as it can show a
+real opportunity, consistent with this project's fail-closed/show-your-work
+principle elsewhere.
+
+LIQUIDITY, 2026-08-26: net_entry_cost alone doesn't tell you how MUCH you
+can trade at that price. This now also computes max_safe_contracts =
+min(short_size_input, long_ask_size_live) -- the largest size where BOTH
+legs can actually fill at the quoted price. The short-leg size is
+user-typed (see ManualQuote.size below) since there's no live feed to read
+it from; the long-leg size is real, live-fetched from Delta's order book.
+A high net_entry_cost with a tiny max_safe_contracts is a real trap this
+project wants to surface, not hide -- see the WARNING printed for low-
+liquidity recommendations.
+
+TAX, 2026-08-26: every recommendation now also reports an Indian VDA tax
+estimate via pricing/tax.py. Per that module's own docstring: NOT TAX
+ADVICE, a documented-assumptions estimate for comparing candidates, confirm
+with a CA before trusting it for a real filing/trading decision.
 
 USAGE:
     Create a small JSON/CSV of what you're seeing on Shark or CoinSwitch's
@@ -30,10 +51,16 @@ USAGE:
 
         [
           {"exchange": "shark", "underlying": "BTC", "option_type": "call",
-           "strike": "67000", "expiry": "2026-08-28", "bid": "205", "ask": "215"},
+           "strike": "67000", "expiry": "2026-08-28", "bid": "205", "ask": "215",
+           "size": "2.5"},
           {"exchange": "coinswitch", "underlying": "BTC", "option_type": "put",
-           "strike": "68000", "expiry": "2026-08-28", "bid": "180", "ask": "190"}
+           "strike": "68000", "expiry": "2026-08-28", "bid": "180", "ask": "190",
+           "size": "1.0"}
         ]
+
+    "size" is optional -- if omitted, max_safe_contracts and the liquidity
+    warning are skipped for that row (printed/persisted as unknown, not
+    guessed at).
 
     Save as manual_quotes.json, then:
 
@@ -44,10 +71,8 @@ USAGE:
     STRICTLY AFTER the short leg's actual settlement instant (short leg's
     date + 1:30 PM IST -- see _short_leg_settlement_instant_utc -- NOT just
     "a later calendar date"), computes net_entry_cost for sell-short/buy-
-    long, and prints a ranked, human-readable report. This correctly
-    includes SAME-DAY Delta contracts (which settle 5:30 PM IST, 4 hours
-    later) -- same-day is the strategy's actual intended shape, not an edge
-    case to exclude.
+    long, a liquidity-capped size, and a tax estimate, then prints AND
+    persists a ranked, human-readable report.
 
     No expiry match on Delta at that exact strike? Prints the closest
     available strikes instead, rather than silently skipping -- so you know
@@ -59,7 +84,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -76,9 +103,10 @@ from pathlib import Path
 _IST_OFFSET = timedelta(hours=5, minutes=30)
 _SHARK_COINSWITCH_SETTLEMENT_TIME_IST = time(13, 30)
 
-from config.settings import DELTA
+from config.settings import DB, DELTA
 from exchange_adapters.delta import DeltaAdapter, DeltaAdapterError
 from normalization.schemas import OptionType
+from pricing.tax import estimate_vda_tax
 
 
 @dataclass
@@ -90,6 +118,7 @@ class ManualQuote:
     expiry: date
     bid: Decimal
     ask: Decimal
+    size: Decimal | None  # user-typed order-book size at `bid` -- see module docstring's LIQUIDITY note
     raw_row: dict  # kept for error messages that quote the original input back
 
 
@@ -104,6 +133,7 @@ def _load_quotes(path: Path) -> list[ManualQuote]:
     quotes: list[ManualQuote] = []
     for i, row in enumerate(rows):
         try:
+            size_raw = row.get("size")
             quotes.append(
                 ManualQuote(
                     exchange=str(row["exchange"]).strip().lower(),
@@ -113,6 +143,7 @@ def _load_quotes(path: Path) -> list[ManualQuote]:
                     expiry=date.fromisoformat(str(row["expiry"])),
                     bid=Decimal(str(row["bid"])),
                     ask=Decimal(str(row["ask"])),
+                    size=Decimal(str(size_raw)) if size_raw not in (None, "") else None,
                     raw_row=row,
                 )
             )
@@ -120,7 +151,7 @@ def _load_quotes(path: Path) -> list[ManualQuote]:
             raise SystemExit(
                 f"Row {i} in '{path}' is malformed ({exc}). Row was: {row}\n"
                 f"Expected keys: exchange, underlying, option_type (call/put), "
-                f"strike, expiry (YYYY-MM-DD), bid, ask."
+                f"strike, expiry (YYYY-MM-DD), bid, ask. Optional: size."
             )
     return quotes
 
@@ -132,8 +163,14 @@ class Recommendation:
     delta_expiry: datetime
     delta_bid: Decimal
     delta_ask: Decimal
+    delta_ask_size: Decimal | None
     net_entry_cost: Decimal
     gap_hours: float
+    max_safe_contracts: Decimal | None
+    gross_profit_estimate: Decimal
+    tax_owed_estimate: Decimal
+    net_profit_after_tax_estimate: Decimal
+    tds_withheld_estimate: Decimal
 
 
 def _short_leg_settlement_instant_utc(quote_date: date) -> datetime:
@@ -203,6 +240,23 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
         net_entry_cost = short_net - long_net
         gap_hours = (contract.expiry_timestamp - short_settlement_instant).total_seconds() / 3600
 
+        # LIQUIDITY: the largest size where BOTH legs can fill at the quoted
+        # price. If either side's size is unknown, this is None (unknown),
+        # never guessed -- an unknown liquidity figure must never silently
+        # become "assume it's fine."
+        max_safe = None
+        if quote.size is not None and snap.ask_size is not None:
+            max_safe = min(quote.size, snap.ask_size)
+
+        # TAX: gross_profit_estimate here is net_entry_cost's favorable
+        # realization (i.e. treating net_entry_cost itself as the trade's
+        # settlement-time profit, per pricing/tax.py's docstring point 5's
+        # assumption). tds base uses the short leg's gross proceeds
+        # (quote.bid * a notional size of 1, since this is a per-contract
+        # figure -- multiply by actual traded quantity yourself before
+        # filing, this is per-contract only).
+        tax = estimate_vda_tax(gross_profit=net_entry_cost, contract_value_for_tds=quote.bid)
+
         recs.append(
             Recommendation(
                 quote=quote,
@@ -210,12 +264,69 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
                 delta_expiry=contract.expiry_timestamp,
                 delta_bid=snap.best_bid,
                 delta_ask=snap.best_ask,
+                delta_ask_size=snap.ask_size,
                 net_entry_cost=net_entry_cost,
                 gap_hours=gap_hours,
+                max_safe_contracts=max_safe,
+                gross_profit_estimate=tax.gross_profit,
+                tax_owed_estimate=tax.tax_owed_estimate,
+                net_profit_after_tax_estimate=tax.net_profit_after_tax,
+                tds_withheld_estimate=tax.tds_withheld_estimate,
             )
         )
 
     return recs
+
+
+def _persist_recommendations(recs: list[Recommendation]) -> int:
+    """Writes every computed recommendation to `manual_recommendations` --
+    not just the entry_eligible ones, per this file's PIVOT note in the
+    module docstring. Returns the count written. A DB write failure here is
+    logged but does not crash the CLI report -- the terminal output is
+    still useful even if persistence fails for some reason (e.g. DB locked
+    by a concurrent pricing run)."""
+    if not recs:
+        return 0
+    try:
+        conn = sqlite3.connect(DB.sqlite_path)
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (
+                str(uuid.uuid4()), now,
+                r.quote.exchange, r.quote.underlying, r.quote.option_type.value,
+                str(r.quote.strike), r.quote.expiry.isoformat(), str(r.quote.bid),
+                "delta_india", r.delta_instrument_id, r.delta_expiry.isoformat(),
+                str(r.delta_ask), str(r.delta_ask_size) if r.delta_ask_size is not None else None,
+                str(r.net_entry_cost), int(r.net_entry_cost > 0),
+                str(r.quote.size) if r.quote.size is not None else None,
+                str(r.max_safe_contracts) if r.max_safe_contracts is not None else None,
+                str(r.gross_profit_estimate), str(r.tax_owed_estimate),
+                str(r.net_profit_after_tax_estimate), str(r.tds_withheld_estimate),
+            )
+            for r in recs
+        ]
+        conn.executemany(
+            """
+            INSERT INTO manual_recommendations (
+                recommendation_id, ts, short_exchange, short_underlying, short_option_type,
+                short_strike, short_expiry_date, short_bid_input,
+                long_exchange, long_instrument_id, long_expiry_ts,
+                long_ask_live, long_ask_size_live,
+                net_entry_cost, entry_eligible,
+                short_size_input, max_safe_contracts,
+                gross_profit_estimate, tax_owed_estimate,
+                net_profit_after_tax_estimate, tds_withheld_estimate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        return len(rows)
+    except sqlite3.Error as exc:
+        print(f"  WARNING: could not persist recommendations to the DB ({exc}) -- "
+              f"terminal report below is still accurate, but won't appear on the dashboard.", file=sys.stderr)
+        return 0
 
 
 def main() -> int:
@@ -235,6 +346,8 @@ def main() -> int:
         "NOTE: manual_fee_pct=0.10% used for the Shark/CoinSwitch leg below is an "
         "UNVERIFIED placeholder (see manual_spread_finder.py) -- check the exchange's "
         "actual fee page before trusting net_entry_cost to the last decimal.\n"
+        "NOTE: tax figures are an ESTIMATE per documented assumptions in pricing/tax.py, "
+        "NOT tax advice -- confirm with a CA before relying on them.\n"
     )
 
     adapter = DeltaAdapter()
@@ -248,6 +361,10 @@ def main() -> int:
                   "Check the strike exists on Delta at all, or try an adjacent strike manually.")
         all_recs.extend(recs)
         print()
+
+    written = _persist_recommendations(all_recs)
+    if all_recs:
+        print(f"Persisted {written}/{len(all_recs)} recommendation(s) to the dashboard DB.\n")
 
     if not all_recs:
         print("No candidates found across any input row. Nothing to recommend.")
@@ -274,14 +391,26 @@ def main() -> int:
     print(f"\nBest {min(5, len(credit_recs))} net-credit candidate(s) -- these are safe to consider manually:\n")
     for r in credit_recs[:5]:
         _print_rec(r)
+        liquidity_note = (
+            f"max safely-fillable size ~{r.max_safe_contracts} contracts"
+            if r.max_safe_contracts is not None
+            else "liquidity UNKNOWN (no size given for the manual leg, or Delta reported no ask_size)"
+        )
         print(
             f"    -> MANUAL ACTION: SELL 1x {r.quote.underlying} {r.quote.option_type.value} "
             f"{r.quote.strike} on {r.quote.exchange} @ ~{r.quote.bid} (expiry {r.quote.expiry}), "
             f"BUY 1x same strike on delta_india @ ~{r.delta_ask} (expiry {r.delta_expiry.date()}, "
             f"instrument {r.delta_instrument_id}). Net credit ~{r.net_entry_cost:.4f} per contract "
-            f"before slippage. VERIFY LIVE PRICES ON BOTH EXCHANGES before executing -- "
-            f"this quote may be stale by the time you read this.\n"
+            f"before slippage. Liquidity: {liquidity_note}. "
+            f"Est. after-tax profit per contract (NOT tax advice): ~{r.net_profit_after_tax_estimate:.4f} "
+            f"(tax ~{r.tax_owed_estimate:.4f}, TDS withheld ~{r.tds_withheld_estimate:.4f}). "
+            f"VERIFY LIVE PRICES ON BOTH EXCHANGES before executing -- this quote may be stale "
+            f"by the time you read this.\n"
         )
+        if r.max_safe_contracts is not None and r.max_safe_contracts < Decimal("1"):
+            print(f"    !! LOW LIQUIDITY WARNING: max safely-fillable size is under 1 contract "
+                  f"({r.max_safe_contracts}) -- the size that looks tradeable on paper may not "
+                  f"actually fill at this price.\n")
 
     return 0
 
