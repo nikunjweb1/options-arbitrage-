@@ -23,6 +23,16 @@ Fixed by adding the old names as aliases alongside the new ones, rather than
 picking a winner and breaking whichever side of this hadn't been tested yet
 in this session.
 
+MISSING PROPERTY FIX 2026-08-26: `DeltaConfig` had base_url/rest_base_url
+(REST) but no ws_base_url at all -- exchange_adapters/delta_ws.py (needed by
+collectors/realtime_collector.py) raised
+`AttributeError: 'DeltaConfig' object has no attribute 'ws_base_url'` on
+first real run. Same underlying cause as the 2026-08-25 fix above (two
+independently-touched files drifting out of sync), just on a code path
+(WebSocket collection) that hadn't been exercised yet in this session. Added
+as a genuine new property, not an alias, since it's a different scheme AND
+subdomain from base_url, not just a renamed value.
+
 Loads from config/.env if present (via python-dotenv, already a dependency per
 requirements.txt), falling back to hardcoded defaults below -- never raises on
 a missing .env file, since SCAN_ONLY mode should work with zero configuration.
@@ -175,6 +185,29 @@ class DeltaConfig:
         COMPATIBILITY FIX note. exchange_adapters/delta.py expects this
         exact name."""
         return self.base_url
+
+    @property
+    def ws_base_url(self) -> str:
+        """
+        WebSocket endpoint -- genuinely different scheme AND subdomain from
+        base_url/rest_base_url above, not just a renamed alias, so it needs
+        its own property rather than reusing REST's URL construction.
+
+        MISSING PROPERTY FOUND + FIXED (2026-08-26): the 2026-08-24
+        reconstruction of this file added base_url/rest_base_url (needed by
+        exchange_adapters/delta.py) but never added this one, needed by
+        exchange_adapters/delta_ws.py -- running
+        `python -m collectors.run_realtime` raised
+        `AttributeError: 'DeltaConfig' object has no attribute 'ws_base_url'`.
+        Same root cause as the 2026-08-25 fix above (two independently-
+        touched files drifting out of sync), just on a code path (WebSocket
+        collection) that hadn't been exercised yet in this session.
+        """
+        return (
+            "wss://testnet-socket.india.delta.exchange"
+            if self.use_testnet
+            else "wss://socket.india.delta.exchange"
+        )
 
 
 DELTA = DeltaConfig(

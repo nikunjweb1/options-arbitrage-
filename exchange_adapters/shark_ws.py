@@ -56,6 +56,26 @@ Confirmed event #3: "indexPrice" (complete, not truncated)
 
 CONNECTION FIX HISTORY, FLAGGED HONESTLY (most recent first):
 
+  2026-08-26 -- FIX: added handle_sigint=False to the socketio.Client()
+  constructor. Root cause, confirmed against a real crash on a Windows end-
+  user run of scanner/shark_delta_screen.py: python-socketio's Client
+  installs its own SIGINT handler by default, which assumes it owns the
+  main thread via a foreground sio.wait() call. This client instead runs
+  sio.wait() inside a background thread (_run(), below) while the caller's
+  main thread does its own time.sleep() -- exactly the "running the Client
+  in a thread" scenario python-socketio's own maintainer confirmed causes a
+  synthesized KeyboardInterrupt on disconnect/reconnect, even with no real
+  Ctrl+C pressed (github.com/miguelgrinberg/python-socketio issues #414 and
+  #453 -- matching traceback shape: socketio/engineio's signal_handler ->
+  original_signal_handler -> KeyboardInterrupt). Because KeyboardInterrupt
+  is a BaseException, not an Exception, it was NOT caught by this file's or
+  shark_delta_screen.py's `except Exception` blocks, so it crashed the
+  entire scan instead of triggering the intended "log a warning, continue
+  with REST-only" fallback. This is a real, separate bug from the
+  connection-itself issues logged below -- it made even a REAL disconnect
+  (from any cause) crash the whole script rather than degrade gracefully,
+  which is the opposite of what shark_delta_screen.py's design intends.
+
   2026-08-25 -- FIX ATTEMPT: optional Cookie header, sourced from
   SHARK_WS_COOKIE env var (config/.env, gitignored), sent only if set.
   Live-tested 2026-08-25: scanner/shark_delta_screen.py's first real run
@@ -273,6 +293,28 @@ class SharkWebSocketClient:
             reconnection_attempts=self._reconnect_max_attempts,
             reconnection_delay=self._reconnect_backoff_base,
             reconnection_delay_max=self._reconnect_backoff_max,
+            # FIX 2026-08-26, confirmed against a real crash on Windows
+            # (scanner/shark_delta_screen.py's first real end-user run):
+            # python-socketio's Client installs its own SIGINT handler by
+            # default (handle_sigint=True), which assumes it owns the main
+            # thread via a foreground sio.wait() call. This client instead
+            # runs sio.wait() inside a background thread (_run(), below)
+            # while the caller's main thread does its own time.sleep() --
+            # exactly the "Client in a thread" scenario the library's own
+            # maintainer confirmed causes a synthesized KeyboardInterrupt to
+            # surface in the main thread on disconnect/reconnect, even with
+            # no real Ctrl+C pressed (github.com/miguelgrinberg/python-
+            # socketio issues #414 and #453 -- same traceback shape:
+            # socketio/engineio's signal_handler -> original_signal_handler
+            # -> KeyboardInterrupt). Because KeyboardInterrupt is a
+            # BaseException, not an Exception, it was NOT caught by this
+            # file's or shark_delta_screen.py's `except Exception` blocks,
+            # so it crashed the entire scan instead of triggering the
+            # intended "log a warning, continue with REST-only" fallback.
+            # handle_sigint=False tells python-socketio "I'm managing
+            # threading myself" -- the documented, maintainer-endorsed fix
+            # for exactly this usage pattern.
+            handle_sigint=False,
         )
         self._register_handlers()
 
