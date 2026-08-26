@@ -45,6 +45,16 @@ estimate via pricing/tax.py. Per that module's own docstring: NOT TAX
 ADVICE, a documented-assumptions estimate for comparing candidates, confirm
 with a CA before trusting it for a real filing/trading decision.
 
+NOTIFICATION, 2026-08-26: alongside the dashboard, net-credit results from
+each run are also sent as a Telegram alert (see
+notifications/telegram_notifier.py) -- the dashboard is best for browsing/
+comparing many candidates side by side, but a phone notification is what
+actually gets seen the moment a real opportunity appears rather than only
+when you happen to have the dashboard open. Best-effort: if Telegram isn't
+configured (see that module's docstring for 3-minute setup) or the API call
+fails, this prints a clear notice and the script's actual output/exit
+behavior is unaffected either way.
+
 USAGE:
     Create a small JSON/CSV of what you're seeing on Shark or CoinSwitch's
     site right now, one row per option you want checked, e.g.:
@@ -106,6 +116,11 @@ _SHARK_COINSWITCH_SETTLEMENT_TIME_IST = time(13, 30)
 from config.settings import DB, DELTA
 from exchange_adapters.delta import DeltaAdapter, DeltaAdapterError
 from normalization.schemas import OptionType
+from notifications.telegram_notifier import (
+    format_recommendation_alert,
+    is_configured as is_telegram_configured,
+    send_telegram_message,
+)
 from pricing.tax import estimate_vda_tax
 
 
@@ -222,10 +237,6 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
     for contract in same_strike_type:
         if contract.expiry_timestamp <= short_settlement_instant:
             continue  # long leg must settle strictly after the short leg's actual settlement instant
-            # (was: same-day Delta contracts (settling 4hrs later at 5:30 PM
-            # IST) were being wrongly excluded here by a date-only
-            # comparison -- same-day IS the strategy's real shape, see the
-            # helper function's docstring above)
         try:
             ticker = adapter.get_ticker(contract.instrument_id)
         except DeltaAdapterError as exc:
@@ -240,21 +251,10 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
         net_entry_cost = short_net - long_net
         gap_hours = (contract.expiry_timestamp - short_settlement_instant).total_seconds() / 3600
 
-        # LIQUIDITY: the largest size where BOTH legs can fill at the quoted
-        # price. If either side's size is unknown, this is None (unknown),
-        # never guessed -- an unknown liquidity figure must never silently
-        # become "assume it's fine."
         max_safe = None
         if quote.size is not None and snap.ask_size is not None:
             max_safe = min(quote.size, snap.ask_size)
 
-        # TAX: gross_profit_estimate here is net_entry_cost's favorable
-        # realization (i.e. treating net_entry_cost itself as the trade's
-        # settlement-time profit, per pricing/tax.py's docstring point 5's
-        # assumption). tds base uses the short leg's gross proceeds
-        # (quote.bid * a notional size of 1, since this is a per-contract
-        # figure -- multiply by actual traded quantity yourself before
-        # filing, this is per-contract only).
         tax = estimate_vda_tax(gross_profit=net_entry_cost, contract_value_for_tds=quote.bid)
 
         recs.append(
@@ -279,12 +279,6 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
 
 
 def _persist_recommendations(recs: list[Recommendation]) -> int:
-    """Writes every computed recommendation to `manual_recommendations` --
-    not just the entry_eligible ones, per this file's PIVOT note in the
-    module docstring. Returns the count written. A DB write failure here is
-    logged but does not crash the CLI report -- the terminal output is
-    still useful even if persistence fails for some reason (e.g. DB locked
-    by a concurrent pricing run)."""
     if not recs:
         return 0
     try:
@@ -411,6 +405,21 @@ def main() -> int:
             print(f"    !! LOW LIQUIDITY WARNING: max safely-fillable size is under 1 contract "
                   f"({r.max_safe_contracts}) -- the size that looks tradeable on paper may not "
                   f"actually fill at this price.\n")
+
+    # NOTIFICATION, 2026-08-26: alongside the dashboard, send a Telegram
+    # alert for the net-credit candidates found in THIS run, so a real
+    # opportunity is visible even when the dashboard isn't open. Best-effort
+    # only -- see notifications/telegram_notifier.py's docstring for why
+    # this never raises or changes this script's exit behavior either way.
+    if is_telegram_configured():
+        alert_text = format_recommendation_alert(credit_recs)
+        sent = send_telegram_message(alert_text)
+        print(f"Telegram notification {'sent' if sent else 'FAILED to send'} for {len(credit_recs[:5])} candidate(s).")
+    else:
+        print(
+            "Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not in config/.env) -- "
+            "skipping notification. See notifications/telegram_notifier.py's docstring for 3-minute setup."
+        )
 
     return 0
 
