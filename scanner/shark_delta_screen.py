@@ -34,7 +34,7 @@ trade. Output is a ranked list for manual review and manual execution on
 both exchanges.
 
 Usage:
-    python -m scanner.shark_delta_screen --underlying BTC --shark-expiry 25AUG26 --delta-date 2026-08-25
+    python -m scanner.shark_delta_screen --underlying BTC --shark-expiry 25AUG26 --delta-date 2026-08-25 [--debug]
 """
 
 from __future__ import annotations
@@ -203,13 +203,15 @@ def print_results(results: list[ScreenResult]) -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--underlying", default="BTC")
     parser.add_argument("--shark-expiry", required=True, help="e.g. 25AUG26 -- must match Shark's real listed expiry")
     parser.add_argument("--delta-date", required=True, help="e.g. 2026-08-25 -- must match Delta's real listed expiry date")
     parser.add_argument("--listen-seconds", type=int, default=20)
+    parser.add_argument("--debug", action="store_true", help="Show DEBUG-level logs, incl. the real reason each Shark REST call failed (per-symbol 404 vs other error) -- INFO level hides these.")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
     delta_expiry = datetime.strptime(args.delta_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     results = run_screen(args.underlying, args.shark_expiry, delta_expiry, args.listen_seconds)
