@@ -35,3 +35,19 @@ data/
 # Logs
 *.log
 logs/
+
+# Personal scratch/debug scripts and live-run artifacts — useful locally,
+# not meant to be shared. If one of these becomes a real reusable tool,
+# move it into pricing/ or a proper scripts/ dir and remove it from here
+# rather than leaving it permanently untracked.
+check_top_signals.py
+diagnose_prob_collapse_temp.py
+inspect_signals_temp.py
+run_log.txt
+reports/
+
+# Live quote inputs for pricing/manual_spread_finder.py — these contain
+# whatever you were watching on Shark/CoinSwitch's site at trade time, not
+# meant to be committed (also goes stale within minutes, so a committed
+# copy is actively misleading to read later).
+manual_quotes*.json
