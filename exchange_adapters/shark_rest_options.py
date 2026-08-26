@@ -53,6 +53,28 @@ guesses, they were reasonable but wrong:
   so they're worth testing on this host (and were originally seen without a
   confirmed host at all -- confirming they live on api-options.sharkexchange.in
   specifically, the same way orderBook did, is the next concrete step).
+
+CRITICAL BUG FOUND AND FIXED 2026-08-26: this endpoint returns application
+errors wrapped INSIDE an HTTP 200 response, not as a real 4xx/5xx status
+code. Confirmed example, symbol whose expiry had already passed (it was
+past 1:30 PM IST, so that day's Shark options had settled):
+
+    GET /v1/market/orderBook?symbol=BTC-26AUG26-79000-C-USDT
+    HTTP status: 200 OK (!)
+    Body: {"response":{"message":"Symbol expired.","error":"Internal Server
+           Error","statusCode":500}, "status":500, "options":{},
+           "message":"Symbol expired.","name":"InternalServerErrorException"}
+
+The original version of get_orderbook_raw() only checked resp.raise_for_status()
+(which saw 200, so raised nothing), then get_orderbook_snapshot() looked for
+a "bids" key that doesn't exist in this error envelope, got None, and
+silently returned an empty MarketSnapshot -- indistinguishable from "this
+symbol genuinely has no bids right now." A full scanner run against 60
+strikes produced 60 silent empty results with zero exceptions logged, which
+looked exactly like "no liquidity anywhere" when the real story was "every
+symbol's expiry had already passed, tell the caller that." Fixed below by
+checking for this envelope shape explicitly and raising with the real
+message, rather than only trusting the transport-level HTTP status code.
 """
 
 from __future__ import annotations
@@ -72,7 +94,19 @@ _REQUEST_TIMEOUT_SEC = 10
 
 
 class SharkOptionsRestError(RuntimeError):
-    """Raised on any failure calling api-options.sharkexchange.in."""
+    """Raised on any failure calling api-options.sharkexchange.in --
+    including the HTTP-200-wrapped-error case documented above. Callers
+    should treat this as 'we don't know the real orderbook state', never
+    as 'confirmed empty book'."""
+
+
+class SharkSymbolExpiredError(SharkOptionsRestError):
+    """Specifically: the requested symbol's expiry has already passed
+    (Shark's own "Symbol expired." message). Distinguished from other
+    SharkOptionsRestError cases because a caller (e.g. the scanner) may
+    want to react differently -- e.g. stop trying that expiry entirely
+    rather than retrying, versus a transient network error which might be
+    worth retrying."""
 
 
 def _dec_or_none(v) -> Decimal | None:
@@ -97,19 +131,57 @@ class SharkOptionsPublicClient:
     def get_orderbook_raw(self, symbol: str) -> dict:
         """
         Confirmed endpoint -- see module docstring. Returns the raw parsed
-        JSON response, exactly as the server sent it.
+        JSON response ONLY if it looks like a real orderbook (has a "bids"
+        or "asks" key). Raises SharkOptionsRestError (or the more specific
+        SharkSymbolExpiredError) for the HTTP-200-wrapped-error case --
+        see this module's CRITICAL BUG note. Never silently returns an
+        error envelope as if it were real data.
         """
         url = f"{_BASE_URL}/v1/market/orderBook"
         try:
             resp = self._session.get(url, params={"symbol": symbol}, timeout=_REQUEST_TIMEOUT_SEC)
-            resp.raise_for_status()
-            return resp.json()
         except requests.RequestException as exc:
             raise SharkOptionsRestError(f"GET {url} (symbol={symbol}) failed: {exc}") from exc
+
+        # Real HTTP-level failure -- still worth checking even though the
+        # confirmed error case above uses 200, in case OTHER failure modes
+        # (rate limiting, auth, etc.) use real status codes instead.
+        if resp.status_code != 200:
+            raise SharkOptionsRestError(
+                f"GET {url} (symbol={symbol}) returned HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise SharkOptionsRestError(f"GET {url} (symbol={symbol}) returned non-JSON body: {resp.text[:300]}") from exc
+
+        # THE FIX: detect Shark's HTTP-200-wrapped-error envelope. Confirmed
+        # shape has a top-level "statusCode" and/or "error"/"name" key and
+        # NO "bids"/"asks" keys -- a real orderbook response never has
+        # these. Checking for the error shape explicitly (rather than just
+        # "bids" is missing) so a genuinely different-but-valid response
+        # shape wouldn't be misclassified as this specific known error.
+        if "bids" not in body and "asks" not in body:
+            err_message = body.get("message") or body.get("response", {}).get("message") if isinstance(body.get("response"), dict) else body.get("message")
+            status_code = body.get("statusCode") or (body.get("response") or {}).get("statusCode") if isinstance(body.get("response"), dict) else body.get("statusCode")
+            if err_message and "expired" in str(err_message).lower():
+                raise SharkSymbolExpiredError(
+                    f"Shark symbol {symbol!r}: {err_message!r} (wrapped in HTTP 200, statusCode={status_code})"
+                )
+            raise SharkOptionsRestError(
+                f"Shark orderBook response for {symbol!r} has neither 'bids' nor 'asks' and isn't a "
+                f"recognized error shape either -- raw body: {str(body)[:300]}"
+            )
+
+        return body
 
     def get_orderbook_snapshot(self, symbol: str) -> MarketSnapshot:
         """
         Same data as get_orderbook_raw(), normalized into a MarketSnapshot.
+        Raises (does not silently return empty) if get_orderbook_raw()
+        couldn't get real data -- see that method and this module's
+        CRITICAL BUG note.
         best_bid/best_ask are the top of the confirmed bids/asks arrays
         (bids are given descending, asks ascending -- confirmed from the
         real captured example in the module docstring, where bids started
