@@ -16,15 +16,34 @@ WHAT "BEST" MEANS HERE, explicitly, so it's never a black box:
      -- never recommends a net-debit trade, per the video's own math.
   2. Must pass ev_engine.py's liquidity check (GAP #1): real resting size on
      both legs, not just a quote that exists.
-  3. Ranked by score = expected_value * probability_of_profit (same
+  3. Must NOT already be expired -- see "BUG FOUND + FIXED" below. Neither
+     leg's own expiry math nor the net-credit/liquidity checks above catch
+     this; it needed its own explicit check.
+  4. Ranked by score = expected_value * probability_of_profit (same
      heuristic run_pricing.py already uses -- not a new, undocumented
      formula invented just for this script).
-  4. Surfaced, not filtered on: the +/-10% stress P&L (GAP #2). A candidate
+  5. Surfaced, not filtered on: the +/-10% stress P&L (GAP #2). A candidate
      with a great grid-based EV but a negative stress_pnl is still shown --
      with that fact printed prominently -- rather than hidden or silently
      excluded, since deciding how much tail risk to accept is exactly the
      kind of judgment call this script exists to hand to a human, not make
      for them.
+
+BUG FOUND + FIXED (2026-08-26): the first real run recommended a spread
+whose short leg had ALREADY EXPIRED FIVE DAYS EARLIER, labeled "URGENT --
+under 1 hour to short-leg expiry." Root cause: ev_engine.py computes
+`time_to_T1_years = max((expiry - now), 0.0)` -- when expiry is in the past,
+this clamps to exactly 0 rather than going negative, and nothing in this
+script (or, it turns out, in pricing/run_pricing.py either -- see that
+file's docstring, which references an "805 skipped: already expired" log
+line that does not actually appear anywhere in its current code) checked
+`short.expiry_timestamp > now` before evaluating a candidate at all. Zero
+hours-to-expiry got interpreted as "about to expire" instead of "already
+dead." This is a dangerous class of bug specifically for a tool whose whole
+purpose is telling a human what to act on RIGHT NOW -- fixed by adding an
+explicit, first-thing expiry check per candidate, independent of (and
+before) any EV/liquidity computation, with its own clearly-labeled skip
+reason so it's auditable, not silent.
 
 WHAT THIS DOES NOT DO:
   - Does not place, modify, or cancel any order. LIVE_TRADING stays
@@ -82,6 +101,10 @@ def _print_ticket(rank: int, pair_id: str, result: EVResult, candidate, short_ts
     stale = short_age > _STALE_DATA_WARNING_SEC or long_age > _STALE_DATA_WARNING_SEC
 
     hrs = result.time_to_short_expiry_hours
+    # hrs is guaranteed > 0 here -- the caller filters out already-expired
+    # candidates before this function is ever called (see the BUG FOUND +
+    # FIXED note in the module docstring). Still worded to never claim
+    # certainty past what the (possibly stale) data actually supports.
     urgency = "URGENT -- under 1 hour to short-leg expiry" if hrs < 1 else \
               "soon -- under 6 hours" if hrs < 6 else \
               f"{hrs:.1f}h remaining"
@@ -94,7 +117,10 @@ def _print_ticket(rank: int, pair_id: str, result: EVResult, candidate, short_ts
         print(f"  !! DATA STALENESS WARNING: short leg quote is {short_age:.0f}s old, "
               f"long leg quote is {long_age:.0f}s old (warn threshold: {_STALE_DATA_WARNING_SEC}s). "
               f"Re-check live prices on the exchange before acting -- do not trust these "
-              f"numbers blindly if the collector has stalled.")
+              f"numbers blindly if the collector has stalled. A stale quote can also mean the "
+              f"'hours remaining' figure above is now wrong even though this candidate wasn't "
+              f"expired at evaluation time -- if the staleness exceeds the hours remaining, "
+              f"treat this ticket as unusable until you refresh the data.")
 
     print(f"\n  LEG 1 -- SELL (short) -- close automatically at expiry, no action needed then")
     print(f"    Exchange:      {short.exchange}")
@@ -182,11 +208,27 @@ def main() -> int:
         conn.close()
         return 1
 
+    now = datetime.now(timezone.utc)
     eligible: list[tuple[str, EVResult, object, datetime, datetime]] = []
+    skipped_expired = 0
 
     for row in candidate_rows:
         candidate = _row_to_candidate(conn, row)
         if candidate is None:
+            continue
+
+        # BUG FIX (see module docstring): this MUST happen before any EV
+        # computation, not be inferred afterward from time_to_short_expiry_hours
+        # -- that field clamps to 0 for already-expired contracts and looks
+        # identical to "about to expire," which is exactly what produced the
+        # original bug (a 5-day-expired contract printed as "URGENT").
+        if candidate.short_contract.expiry_timestamp <= now:
+            skipped_expired += 1
+            logger.debug(
+                "%s: short leg expired at %s, which is in the past -- not a live "
+                "opportunity, skipping regardless of any other metric.",
+                row["pair_id"], candidate.short_contract.expiry_timestamp,
+            )
             continue
 
         short_snapshot = _load_latest_snapshot(conn, candidate.short_contract.exchange, candidate.short_contract.instrument_id)
@@ -212,10 +254,15 @@ def main() -> int:
 
     conn.close()
 
+    if skipped_expired:
+        print(f"\n({skipped_expired} candidate(s) skipped: short leg already expired -- "
+              f"stale candidate_pairs/matcher data. Consider re-running "
+              f"matching/run_matcher.py against fresh instruments if this number is large.)")
+
     if not eligible:
-        print(f"\nNo entry-eligible (net-credit, liquid) spreads found for {args.underlying} "
-              f"right now. This is a real, honest 'nothing to trade' result -- not an error. "
-              f"Re-run in a few minutes, or check that the collector "
+        print(f"\nNo entry-eligible (net-credit, liquid, non-expired) spreads found for "
+              f"{args.underlying} right now. This is a real, honest 'nothing to trade' "
+              f"result -- not an error. Re-run in a few minutes, or check that the collector "
               f"(collectors/run_realtime.py) is actually running and current.")
         return 0
 
