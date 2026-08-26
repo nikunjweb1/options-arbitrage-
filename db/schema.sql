@@ -102,6 +102,65 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals (ts);
 CREATE INDEX IF NOT EXISTS idx_signals_entry_eligible ON signals (entry_eligible);
 
+-- Manual recommendations (pricing/manual_spread_finder.py output).
+-- Added 2026-08-26 alongside the project's pivot from full automation to a
+-- manual-trading-assistant model (see docs/architecture.md's latest
+-- section): since Shark/CoinSwitch have no reliable automated data feed
+-- yet, the short leg's price is manually observed and typed in by a human
+-- watching the exchange's own website, run through
+-- pricing/manual_spread_finder.py, and the result needs to be visible on
+-- the dashboard (not just printed to a terminal) so it's actually usable
+-- as a "check this, then go trade it" workflow.
+--
+-- Distinct from `signals` deliberately, not reusing that table: `signals`
+-- rows are produced by a fully-automated pipeline against live-fetched
+-- data on both legs (see pricing/run_pricing.py) and its `pair_id` foreign
+-- key assumes both legs already exist as rows in `candidate_pairs`/
+-- `instruments`. A manual recommendation's short leg is user-typed input
+-- that was never fetched from any adapter and doesn't correspond to a
+-- `candidate_pairs` row at all -- forcing it into `signals`' shape would
+-- mean fabricating a fake candidate_pairs/instruments row for data that
+-- was never actually observed via any adapter, which is exactly the kind
+-- of silent fabrication this project's fail-closed principle exists to
+-- prevent elsewhere (see pricing/ev_engine.py's InsufficientDataError).
+CREATE TABLE IF NOT EXISTS manual_recommendations (
+    recommendation_id     TEXT PRIMARY KEY,
+    ts                     TEXT NOT NULL,
+    short_exchange           TEXT NOT NULL,  -- user-typed, e.g. 'shark' or 'coinswitch' -- NOT a candidate_pairs FK
+    short_underlying          TEXT NOT NULL,
+    short_option_type          TEXT NOT NULL CHECK (short_option_type IN ('call', 'put')),
+    short_strike                 TEXT NOT NULL,
+    short_expiry_date              TEXT NOT NULL,  -- date only (YYYY-MM-DD) -- user input has no time component
+    short_bid_input                  TEXT NOT NULL,  -- exactly what the user typed in, unmodified
+    long_exchange                       TEXT NOT NULL,  -- always 'delta_india' currently, but not hardcoded here
+    long_instrument_id                    TEXT NOT NULL,
+    long_expiry_ts                          TEXT NOT NULL,
+    long_ask_live                             TEXT NOT NULL,  -- live-fetched at check time, per architecture.md Section A.1
+    long_ask_size_live                          TEXT,          -- for liquidity scoring, see below
+    net_entry_cost                                TEXT NOT NULL,
+    entry_eligible                                  INTEGER NOT NULL CHECK (entry_eligible IN (0, 1)),
+    -- Liquidity scoring added 2026-08-26 alongside tax modeling (see
+    -- pricing/tax.py): the short leg's size is whatever the user typed in
+    -- (their own read of Shark/CoinSwitch's order book, which this project
+    -- cannot independently verify -- see manual_spread_finder.py for the
+    -- honesty note on why this is trusted input, not verified data), the
+    -- long leg's size is real live data from Delta's own order book.
+    -- max_safe_contracts = min(short_size_input, long_ask_size_live) --
+    -- the largest size where BOTH legs can actually fill at the quoted
+    -- price, not just one of them.
+    short_size_input                                  TEXT,
+    max_safe_contracts                                  TEXT,
+    -- Tax fields, per pricing/tax.py -- see that module's docstring for
+    -- the full list of assumptions this is NOT authoritative advice under.
+    gross_profit_estimate                                 TEXT,
+    tax_owed_estimate                                       TEXT,
+    net_profit_after_tax_estimate                             TEXT,
+    tds_withheld_estimate                                       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_manual_recommendations_ts ON manual_recommendations (ts);
+CREATE INDEX IF NOT EXISTS idx_manual_recommendations_eligible ON manual_recommendations (entry_eligible);
+
 -- Trades (Phase 7/8 output -- paper and, eventually and only with explicit
 -- approval, live)
 CREATE TABLE IF NOT EXISTS trades (
