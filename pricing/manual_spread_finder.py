@@ -40,10 +40,14 @@ USAGE:
         python -m pricing.manual_spread_finder --quotes manual_quotes.json
 
     For each row, this fetches Delta's live chain for the same
-    underlying/option_type/strike, finds every Delta expiry AFTER the
-    manually-entered expiry (the long leg must expire later, per the
-    strategy's core mechanism), computes net_entry_cost for
-    sell-short/buy-long, and prints a ranked, human-readable report.
+    underlying/option_type/strike, finds every Delta contract that SETTLES
+    STRICTLY AFTER the short leg's actual settlement instant (short leg's
+    date + 1:30 PM IST -- see _short_leg_settlement_instant_utc -- NOT just
+    "a later calendar date"), computes net_entry_cost for sell-short/buy-
+    long, and prints a ranked, human-readable report. This correctly
+    includes SAME-DAY Delta contracts (which settle 5:30 PM IST, 4 hours
+    later) -- same-day is the strategy's actual intended shape, not an edge
+    case to exclude.
 
     No expiry match on Delta at that exact strike? Prints the closest
     available strikes instead, rather than silently skipping -- so you know
@@ -57,9 +61,20 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+# Per docs/architecture.md Section 0 (confirmed against Delta's own docs) and
+# this session's screenshot evidence (CoinSwitch/Shark both showing ~27-30min
+# to expiry at 1:02-1:00 PM IST, i.e. settling ~1:30 PM IST): Shark/CoinSwitch
+# options settle at 1:30 PM IST. This is used to build the SHORT leg's exact
+# settlement instant from its date, since the manual quote input only
+# captures a date, not a time -- without this, "same day, 4 hours later" (the
+# strategy's actual shape) was being misidentified as "no same-day match" and
+# skipped, see this file's fix history / commit message.
+_IST_OFFSET = timedelta(hours=5, minutes=30)
+_SHARK_COINSWITCH_SETTLEMENT_TIME_IST = time(13, 30)
 
 from config.settings import DELTA
 from exchange_adapters.delta import DeltaAdapter, DeltaAdapterError
@@ -118,7 +133,18 @@ class Recommendation:
     delta_bid: Decimal
     delta_ask: Decimal
     net_entry_cost: Decimal
-    gap_days: float
+    gap_hours: float
+
+
+def _short_leg_settlement_instant_utc(quote_date: date) -> datetime:
+    """Builds the short leg's actual settlement instant (date + 1:30 PM IST,
+    converted to UTC) -- NOT just a date. Comparing full instants (not just
+    calendar dates) is what correctly allows same-day Delta contracts
+    (which settle 5:30 PM IST, 4 hours later) to qualify as valid long legs
+    -- this is the strategy's actual, intended shape, per the source video
+    and docs/architecture.md Section 0."""
+    naive_ist = datetime.combine(quote_date, _SHARK_COINSWITCH_SETTLEMENT_TIME_IST)
+    return (naive_ist - _IST_OFFSET).replace(tzinfo=timezone.utc)
 
 
 def _fee_adjusted(price: Decimal, fee_pct: Decimal, *, is_sell: bool) -> Decimal:
@@ -153,10 +179,16 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
     manual_fee_pct = Decimal("0.001")  # unverified placeholder for Shark/CoinSwitch, see manual_fee_pct note below
     delta_fee_pct = DELTA.fee_schedule.taker_fee_pct
 
+    short_settlement_instant = _short_leg_settlement_instant_utc(quote.expiry)
+
     recs: list[Recommendation] = []
     for contract in same_strike_type:
-        if contract.expiry_timestamp.date() <= quote.expiry:
-            continue  # long leg must expire strictly later -- same-day or earlier isn't this strategy
+        if contract.expiry_timestamp <= short_settlement_instant:
+            continue  # long leg must settle strictly after the short leg's actual settlement instant
+            # (was: same-day Delta contracts (settling 4hrs later at 5:30 PM
+            # IST) were being wrongly excluded here by a date-only
+            # comparison -- same-day IS the strategy's real shape, see the
+            # helper function's docstring above)
         try:
             ticker = adapter.get_ticker(contract.instrument_id)
         except DeltaAdapterError as exc:
@@ -169,7 +201,7 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
         short_net = _fee_adjusted(quote.bid, manual_fee_pct, is_sell=True)
         long_net = _fee_adjusted(snap.best_ask, delta_fee_pct, is_sell=False)
         net_entry_cost = short_net - long_net
-        gap_days = (contract.expiry_timestamp.date() - quote.expiry).days
+        gap_hours = (contract.expiry_timestamp - short_settlement_instant).total_seconds() / 3600
 
         recs.append(
             Recommendation(
@@ -179,7 +211,7 @@ def find_candidates_for_quote(adapter: DeltaAdapter, quote: ManualQuote) -> list
                 delta_bid=snap.best_bid,
                 delta_ask=snap.best_ask,
                 net_entry_cost=net_entry_cost,
-                gap_days=gap_days,
+                gap_hours=gap_hours,
             )
         )
 
@@ -212,7 +244,7 @@ def main() -> int:
               f"(expiry {quote.expiry}, bid={quote.bid}/ask={quote.ask}) against Delta's chain...")
         recs = find_candidates_for_quote(adapter, quote)
         if not recs:
-            print("  No Delta contract found at this exact strike with a later expiry. "
+            print("  No Delta contract found at this exact strike settling after the short leg. "
                   "Check the strike exists on Delta at all, or try an adjacent strike manually.")
         all_recs.extend(recs)
         print()
@@ -256,7 +288,7 @@ def main() -> int:
 
 def _print_rec(r: Recommendation) -> None:
     print(
-        f"  net_entry_cost={r.net_entry_cost:+.4f}  gap={r.gap_days:.0f}d  "
+        f"  net_entry_cost={r.net_entry_cost:+.4f}  gap={r.gap_hours:.1f}h  "
         f"{r.quote.exchange}:{r.quote.strike}{r.quote.option_type.value[0].upper()} "
         f"(exp {r.quote.expiry}) -> delta_india:{r.delta_instrument_id} "
         f"(exp {r.delta_expiry.date()}, bid={r.delta_bid}/ask={r.delta_ask})"
