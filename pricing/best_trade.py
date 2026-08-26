@@ -58,6 +58,30 @@ WHAT THIS DOES NOT DO:
     data isn't wired into the collector yet (Section M.6). The "spread" this
     prints is a same-exchange Delta calendar spread, not the cross-exchange
     trade the source video describes, until that changes.
+  - Is NOT tax advice. See _tax_adjusted() below: this is a disclosed,
+    simplified approximation of general Indian crypto tax rules, not a
+    personalized calculation, and the TDS treatment specifically for
+    OPTIONS (as opposed to spot VDA transfers, which Section 194S was
+    written for) is not officially clarified anywhere this project found.
+    Verify with a real tax professional before trusting the after-tax
+    number for an actual filing decision -- treat it as directionally
+    useful, not exact.
+
+TAX MODELING (added 2026-08-26, per explicit request to account for this):
+  - Flat 30% tax on GAINS only (Section 115BBH), applied to expected_value
+    when positive. No loss offset against other income/gains is modeled --
+    if expected_value is negative, tax_on_gains is 0 (you don't get a tax
+    "credit" for an expected loss, and this project isn't attempting to
+    model set-off rules across a whole portfolio, only this one trade).
+  - 1% TDS (Section 194S) estimated on total transacted notional (both legs'
+    entry value) -- a genuine approximation, not a confirmed rule for
+    options specifically. Flagged in every ticket, not silently applied.
+  - net_profit_after_tax = expected_value - tax_on_gains - tds_estimate.
+    TDS is a withholding, not a final tax -- it's credited against your
+    actual year-end tax liability, not lost. It's still subtracted here
+    because it affects near-term cash flow, which matters for someone
+    manually trading with limited capital -- but it's not "gone money"
+    the way tax_on_gains is.
 
 Usage:
     python -m pricing.best_trade --underlying BTC
@@ -71,6 +95,7 @@ import argparse
 import logging
 import sqlite3
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -87,17 +112,145 @@ logger = logging.getLogger("pricing.best_trade")
 # about to act on it needs to know if the collector has fallen behind.
 _STALE_DATA_WARNING_SEC = 30
 
+# See "TAX MODELING" in the module docstring above -- a disclosed
+# approximation, not personalized tax advice.
+_INDIA_FLAT_TAX_RATE = Decimal("0.30")
+_INDIA_TDS_RATE = Decimal("0.01")
+
 
 def _seconds_stale(ts: datetime) -> float:
     return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
-def _print_ticket(rank: int, pair_id: str, result: EVResult, candidate, short_ts: datetime, long_ts: datetime) -> None:
+@dataclass(frozen=True)
+class TaxEstimate:
+    tax_on_gains: Decimal
+    tds_estimate: Decimal
+    net_profit_after_tax: Decimal
+    transacted_notional: Decimal
+
+
+def _tax_adjusted(result: EVResult) -> TaxEstimate:
+    """See "TAX MODELING" in this module's docstring for exactly what is
+    and isn't modeled here, and why it's an approximation, not advice."""
+    tax_on_gains = (
+        result.expected_value * _INDIA_FLAT_TAX_RATE
+        if result.expected_value > 0
+        else Decimal("0")
+    )
+    transacted_notional = result.short_bid_scaled + result.long_ask_scaled
+    tds_estimate = transacted_notional * _INDIA_TDS_RATE
+    net_profit_after_tax = result.expected_value - tax_on_gains - tds_estimate
+    return TaxEstimate(
+        tax_on_gains=tax_on_gains,
+        tds_estimate=tds_estimate,
+        net_profit_after_tax=net_profit_after_tax,
+        transacted_notional=transacted_notional,
+    )
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    pair_id: str
+    result: EVResult
+    candidate: object
+    short_snapshot_ts: datetime
+    long_snapshot_ts: datetime
+    tax: TaxEstimate
+    stress_clean: bool
+
+
+def compute_recommendations(
+    conn: sqlite3.Connection,
+    underlying: str,
+    *,
+    min_confidence: float = 0.9,
+    allow_negative_stress: bool = False,
+) -> tuple[list[Recommendation], int]:
+    """
+    Shared implementation for both the CLI (main(), below) and the
+    dashboard API (dashboard/backend/app.py's /api/best-trade). Kept as a
+    single function deliberately -- the CLI and the API showing DIFFERENT
+    recommendations because the logic was copy-pasted and drifted apart
+    would be a much worse bug than either one being temporarily unavailable.
+
+    Returns (recommendations sorted best-first, count of expired-and-skipped
+    candidates).
+    """
+    candidate_rows = get_candidate_pairs(conn, min_confidence=min_confidence)
+    filtered = []
+    for row in candidate_rows:
+        short = get_contract(conn, row["short_exchange"], row["short_instrument_id"])
+        if short is not None and short.underlying == underlying:
+            filtered.append(row)
+    candidate_rows = filtered
+
+    now = datetime.now(timezone.utc)
+    eligible: list[Recommendation] = []
+    skipped_expired = 0
+
+    for row in candidate_rows:
+        candidate = _row_to_candidate(conn, row)
+        if candidate is None:
+            continue
+
+        # BUG FIX (see module docstring): this MUST happen before any EV
+        # computation -- time_to_short_expiry_hours clamps to 0 for
+        # already-expired contracts and looks identical to "about to
+        # expire" otherwise.
+        if candidate.short_contract.expiry_timestamp <= now:
+            skipped_expired += 1
+            continue
+
+        short_snapshot = _load_latest_snapshot(conn, candidate.short_contract.exchange, candidate.short_contract.instrument_id)
+        long_snapshot = _load_latest_snapshot(conn, candidate.long_contract.exchange, candidate.long_contract.instrument_id)
+        if short_snapshot is None or long_snapshot is None:
+            continue
+
+        engine = LeanEVEngine(
+            short_taker_fee_pct=_fee_pct_for(candidate.short_contract.exchange),
+            long_taker_fee_pct=_fee_pct_for(candidate.long_contract.exchange),
+            min_contract_size=RISK.min_liquidity,
+        )
+
+        try:
+            result = engine.evaluate(candidate, short_snapshot, long_snapshot)
+        except InsufficientDataError:
+            continue
+
+        if result.net_entry_cost <= RISK.min_net_credit:
+            continue  # Section M.2: never recommend a net-debit trade, full stop.
+
+        stress_clean = result.stress_pnl_down_10pct >= 0 and result.stress_pnl_up_10pct >= 0
+        eligible.append(
+            Recommendation(
+                pair_id=row["pair_id"],
+                result=result,
+                candidate=candidate,
+                short_snapshot_ts=short_snapshot.timestamp,
+                long_snapshot_ts=long_snapshot.timestamp,
+                tax=_tax_adjusted(result),
+                stress_clean=stress_clean,
+            )
+        )
+
+    def sort_key(rec: Recommendation):
+        score = rec.result.expected_value * rec.result.probability_of_profit
+        if allow_negative_stress:
+            return score
+        return (rec.stress_clean, score)
+
+    eligible.sort(key=sort_key, reverse=True)
+    return eligible, skipped_expired
+
+
+def _print_ticket(rank: int, rec: Recommendation) -> None:
+    pair_id, result, candidate = rec.pair_id, rec.result, rec.candidate
     short = candidate.short_contract
     long_ = candidate.long_contract
 
-    short_age = _seconds_stale(short_ts)
-    long_age = _seconds_stale(long_ts)
+    short_age = _seconds_stale(rec.short_snapshot_ts)
+    long_age = _seconds_stale(rec.long_snapshot_ts)
     stale = short_age > _STALE_DATA_WARNING_SEC or long_age > _STALE_DATA_WARNING_SEC
 
     hrs = result.time_to_short_expiry_hours
@@ -149,7 +302,7 @@ def _print_ticket(rank: int, pair_id: str, result: EVResult, candidate, short_ts
 
     print(f"\n  ECONOMICS")
     print(f"    Net entry credit:     {result.net_entry_cost}  (fees included: {result.fees_total})")
-    print(f"    Expected value:       {result.expected_value}")
+    print(f"    Expected value (EV):  {result.expected_value}")
     print(f"    P(profit), 21x3 grid: {float(result.probability_of_profit):.0%}")
     print(f"    Worst case (in grid): {result.worst_case_pnl}")
     print(f"    Best case (in grid):  {result.best_case_pnl}")
@@ -157,6 +310,12 @@ def _print_ticket(rank: int, pair_id: str, result: EVResult, candidate, short_ts
           f"{'  << NEGATIVE, outside the normal grid range -- read this' if result.stress_pnl_down_10pct < 0 else ''}")
     print(f"    Stress +10% spot:     {result.stress_pnl_up_10pct}"
           f"{'  << NEGATIVE, outside the normal grid range -- read this' if result.stress_pnl_up_10pct < 0 else ''}")
+
+    print(f"\n  AFTER-TAX ESTIMATE (India, APPROXIMATE -- see module docstring, not tax advice)")
+    print(f"    Transacted notional (both legs): {rec.tax.transacted_notional}")
+    print(f"    Tax on gains (30% flat, EV>0 only): -{rec.tax.tax_on_gains}")
+    print(f"    TDS estimate (1% of notional, 194S, options treatment UNCONFIRMED): -{rec.tax.tds_estimate}")
+    print(f"    Net profit after tax + TDS:       {rec.tax.net_profit_after_tax}")
 
     print(f"\n  MANUAL EXECUTION CHECKLIST (per architecture.md Section M.1/M.3):")
     print(f"    [ ] 1. Place both legs as close to simultaneously as you can manage manually --")
@@ -193,65 +352,11 @@ def main() -> int:
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
 
-    candidate_rows = get_candidate_pairs(conn, min_confidence=args.min_confidence)
-    filtered = []
-    for row in candidate_rows:
-        short = get_contract(conn, row["short_exchange"], row["short_instrument_id"])
-        if short is not None and short.underlying == args.underlying:
-            filtered.append(row)
-    candidate_rows = filtered
-
-    if not candidate_rows:
-        print(f"No high-confidence (>={args.min_confidence}) candidate pairs found for "
-              f"{args.underlying}. Has matching/run_matcher.py run recently against fresh "
-              f"instrument data? Candidates expire constantly -- re-run it if this is stale.")
-        conn.close()
-        return 1
-
-    now = datetime.now(timezone.utc)
-    eligible: list[tuple[str, EVResult, object, datetime, datetime]] = []
-    skipped_expired = 0
-
-    for row in candidate_rows:
-        candidate = _row_to_candidate(conn, row)
-        if candidate is None:
-            continue
-
-        # BUG FIX (see module docstring): this MUST happen before any EV
-        # computation, not be inferred afterward from time_to_short_expiry_hours
-        # -- that field clamps to 0 for already-expired contracts and looks
-        # identical to "about to expire," which is exactly what produced the
-        # original bug (a 5-day-expired contract printed as "URGENT").
-        if candidate.short_contract.expiry_timestamp <= now:
-            skipped_expired += 1
-            logger.debug(
-                "%s: short leg expired at %s, which is in the past -- not a live "
-                "opportunity, skipping regardless of any other metric.",
-                row["pair_id"], candidate.short_contract.expiry_timestamp,
-            )
-            continue
-
-        short_snapshot = _load_latest_snapshot(conn, candidate.short_contract.exchange, candidate.short_contract.instrument_id)
-        long_snapshot = _load_latest_snapshot(conn, candidate.long_contract.exchange, candidate.long_contract.instrument_id)
-        if short_snapshot is None or long_snapshot is None:
-            continue
-
-        engine = LeanEVEngine(
-            short_taker_fee_pct=_fee_pct_for(candidate.short_contract.exchange),
-            long_taker_fee_pct=_fee_pct_for(candidate.long_contract.exchange),
-            min_contract_size=RISK.min_liquidity,
-        )
-
-        try:
-            result = engine.evaluate(candidate, short_snapshot, long_snapshot)
-        except InsufficientDataError:
-            continue
-
-        if result.net_entry_cost <= RISK.min_net_credit:
-            continue  # Section M.2: never recommend a net-debit trade, full stop.
-
-        eligible.append((row["pair_id"], result, candidate, short_snapshot.timestamp, long_snapshot.timestamp))
-
+    eligible, skipped_expired = compute_recommendations(
+        conn, args.underlying,
+        min_confidence=args.min_confidence,
+        allow_negative_stress=args.allow_negative_stress,
+    )
     conn.close()
 
     if skipped_expired:
@@ -266,30 +371,19 @@ def main() -> int:
               f"(collectors/run_realtime.py) is actually running and current.")
         return 0
 
-    def sort_key(item):
-        _, result, *_ = item
-        score = result.expected_value * result.probability_of_profit
-        if args.allow_negative_stress:
-            return score
-        stress_ok = result.stress_pnl_down_10pct >= 0 and result.stress_pnl_up_10pct >= 0
-        # Sort stress-clean candidates first (True > False sorts descending
-        # correctly with reverse=True below), then by score within each group.
-        return (stress_ok, score)
-
-    eligible.sort(key=sort_key, reverse=True)
-
     print(f"\nFound {len(eligible)} entry-eligible spread(s) for {args.underlying}. "
           f"Showing top {min(args.top_n, len(eligible))}.")
     if not args.allow_negative_stress:
-        clean_count = sum(1 for _, r, *_ in eligible if r.stress_pnl_down_10pct >= 0 and r.stress_pnl_up_10pct >= 0)
+        clean_count = sum(1 for rec in eligible if rec.stress_clean)
         print(f"({clean_count}/{len(eligible)} pass the +/-10% stress check cleanly -- those are ranked first.)")
 
-    for i, (pair_id, result, candidate, short_ts, long_ts) in enumerate(eligible[: args.top_n], start=1):
-        _print_ticket(i, pair_id, result, candidate, short_ts, long_ts)
+    for i, rec in enumerate(eligible[: args.top_n], start=1):
+        _print_ticket(i, rec)
 
     print(f"\n{'=' * 78}")
     print("Reminder: this tool only analyzes and reports. Nothing here places an order.")
     print("You execute both legs manually, on the exchange's own UI, using the details above.")
+    print("After-tax figures are an approximation, not tax advice -- see module docstring.")
     print(f"{'=' * 78}\n")
 
     return 0
