@@ -2,8 +2,9 @@
 Read-only research dashboard API.
 
 Serves data that already exists in the project's SQLite DB (instruments,
-candidate_pairs, signals) so results from pricing/run_pricing.py and
-backtest/run_backtest.py are visible without re-running anything.
+candidate_pairs, signals, manual_recommendations) so results from
+pricing/run_pricing.py and pricing/manual_spread_finder.py are visible
+without re-running anything.
 
 Deliberately self-contained: does NOT import config.settings, because that
 module is currently a placeholder stub in the repo (see the "known repo
@@ -39,7 +40,7 @@ DB_PATH = Path(os.environ.get("SQLITE_PATH", "data/options_arb.db"))
 app = FastAPI(
     title="Options Arbitrage — Research Dashboard (read-only)",
     description=(
-        "Visualizes existing signals/candidate_pairs data. "
+        "Visualizes existing signals/candidate_pairs/manual_recommendations data. "
         "No write endpoints. No trading. No LIVE_TRADING dependency."
     ),
 )
@@ -259,3 +260,79 @@ def list_candidates(limit: int = Query(100, ge=1, le=1000)) -> dict:
         "count": len(rows),
         "results": [dict(r) for r in rows],
     }
+
+
+@app.get("/api/manual-recommendations")
+def list_manual_recommendations(
+    entry_eligible: Optional[bool] = Query(
+        None, description="Filter to entry_eligible=1 (net-credit) recommendations only if true"
+    ),
+    limit: int = Query(50, ge=1, le=500),
+) -> dict:
+    """
+    Output of pricing/manual_spread_finder.py -- the manual-trading-
+    assistant workflow's actual "message shown on the website" surface.
+    Every recommendation ever computed is stored, not just the good ones
+    (see that script's module docstring) -- entry_eligible=true here is
+    what should drive a banner/highlight on the frontend, since per
+    docs/architecture.md Section M.2, a net-debit recommendation has
+    unbounded downside and should never be presented as an opportunity to
+    act on, only as "checked, wasn't good enough."
+
+    Tax figures returned here are per pricing/tax.py's documented
+    assumptions -- NOT tax advice, surfaced as such in this response's
+    field names deliberately (the "_estimate" suffix is not decorative).
+    """
+    where = "WHERE entry_eligible = 1" if entry_eligible else ""
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT
+                recommendation_id, ts,
+                short_exchange, short_underlying, short_option_type, short_strike,
+                short_expiry_date, short_bid_input,
+                long_exchange, long_instrument_id, long_expiry_ts,
+                long_ask_live, long_ask_size_live,
+                net_entry_cost, entry_eligible,
+                short_size_input, max_safe_contracts,
+                gross_profit_estimate, tax_owed_estimate,
+                net_profit_after_tax_estimate, tds_withheld_estimate
+            FROM manual_recommendations
+            {where}
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    results = []
+    for r in rows:
+        max_safe = _f(r["max_safe_contracts"])
+        results.append(
+            {
+                "recommendation_id": r["recommendation_id"],
+                "ts": r["ts"],
+                "short_exchange": r["short_exchange"],
+                "short_underlying": r["short_underlying"],
+                "short_option_type": r["short_option_type"],
+                "short_strike": _f(r["short_strike"]),
+                "short_expiry_date": r["short_expiry_date"],
+                "short_bid_input": _f(r["short_bid_input"]),
+                "long_exchange": r["long_exchange"],
+                "long_instrument_id": r["long_instrument_id"],
+                "long_expiry_ts": r["long_expiry_ts"],
+                "long_ask_live": _f(r["long_ask_live"]),
+                "long_ask_size_live": _f(r["long_ask_size_live"]),
+                "net_entry_cost": _f(r["net_entry_cost"]),
+                "entry_eligible": bool(r["entry_eligible"]),
+                "short_size_input": _f(r["short_size_input"]),
+                "max_safe_contracts": max_safe,
+                "low_liquidity_warning": (max_safe is not None and max_safe < 1.0),
+                "gross_profit_estimate": _f(r["gross_profit_estimate"]),
+                "tax_owed_estimate": _f(r["tax_owed_estimate"]),
+                "net_profit_after_tax_estimate": _f(r["net_profit_after_tax_estimate"]),
+                "tds_withheld_estimate": _f(r["tds_withheld_estimate"]),
+                "tax_disclaimer": "Estimate only, not tax advice -- see pricing/tax.py for assumptions.",
+            }
+        )
+    return {"count": len(results), "results": results}
