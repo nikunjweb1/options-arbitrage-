@@ -45,15 +45,6 @@ guesses, they were reasonable but wrong:
   symmetry with the futures API going forward; each endpoint needs its own
   real confirmation.
 
-  The more promising lead for get_option_chain(), still untested: the
-  actual endpoint NAMES seen firing from the live options page's Fetch/XHR
-  panel earlier this session -- basePairs, delivery-times, options-tier-info,
-  instrument-info, and a paginated list?page=...&pageSize=...&isPast=...
-  request. Those are real observed request names, not guesses by analogy,
-  so they're worth testing on this host (and were originally seen without a
-  confirmed host at all -- confirming they live on api-options.sharkexchange.in
-  specifically, the same way orderBook did, is the next concrete step).
-
 CRITICAL BUG FOUND AND FIXED 2026-08-26: this endpoint returns application
 errors wrapped INSIDE an HTTP 200 response, not as a real 4xx/5xx status
 code. Confirmed example, symbol whose expiry had already passed (it was
@@ -69,12 +60,62 @@ The original version of get_orderbook_raw() only checked resp.raise_for_status()
 (which saw 200, so raised nothing), then get_orderbook_snapshot() looked for
 a "bids" key that doesn't exist in this error envelope, got None, and
 silently returned an empty MarketSnapshot -- indistinguishable from "this
-symbol genuinely has no bids right now." A full scanner run against 60
-strikes produced 60 silent empty results with zero exceptions logged, which
-looked exactly like "no liquidity anywhere" when the real story was "every
-symbol's expiry had already passed, tell the caller that." Fixed below by
-checking for this envelope shape explicitly and raising with the real
-message, rather than only trusting the transport-level HTTP status code.
+symbol genuinely has no bids right now." Fixed below by checking for this
+envelope shape explicitly and raising with the real message, rather than
+only trusting the transport-level HTTP status code.
+
+THREE MORE ENDPOINTS CONFIRMED 2026-08-28 (real DevTools capture, Headers +
+Response both verified for each):
+
+  GET /v1/exchange/basePairs
+    -> 200, no auth, array of per-underlying config, e.g.:
+      {"baseCoin":"BTC","quoteCoin":"USDT","displayName":"BTC-USDT",
+       "makerFeePercentage":0.015,"takerFeePercentage":0.02, ...}
+    Real, API-sourced fee percentages -- more authoritative than the
+    support-doc-derived formulas previously in architecture.md Section M.6.
+    Note the icon URL under this and other Shark options responses points
+    at storage.googleapis.com/pi42-dev-static/... -- strong evidence Shark's
+    OPTIONS backend specifically runs on Pi42's infrastructure (white-label),
+    independent of whatever Shark's futures stack (api.sharkexchange.in) is.
+
+  GET /v1/exchange/delivery-times?baseCoin={BASE}&quoteCoin={QUOTE}
+    -> 200, no auth, response body is a flat JSON array of epoch-millisecond
+    expiry timestamps, e.g.:
+      [1787904000000,1787990400000,1788076800000,1788508800000,...]
+    THIS REPLACES GUESSING/HAND-TYPING --shark-expiry: a caller can fetch
+    this directly and pick the next expiry >= now. Consecutive early entries
+    are exactly 86400000ms (24h) apart, consistent with a fixed daily
+    settlement time (not yet independently re-confirmed as exactly 1:30 PM
+    IST from THIS endpoint specifically -- that figure comes from
+    architecture.md Section M.6's separate confirmation).
+
+  POST /v1/exchange/instrument-info-symbol
+    -> 201, no auth. Real captured response for symbol="BTC-28AUG26-79750-C-USDT":
+      {"symbol":"BTC-28AUG26-79750-C-USDT","strikePrice":79750,"baseCoin":"BTC",
+       "quoteCoin":"USDT","settleCoin":"INR","optionsType":"Call",
+       "launchTime":1787796300000,"deliveryTime":1787904000000,
+       "deliveryFeeRate":0.015,
+       "priceFilter":{"maxPrice":"1110000","minPrice":"5","tickSize":"5",
+         "quoteCoinPrecision":4,"settleCoinPrecision":2,"pricePrecision":2},
+       "lotSizeFilter":{"qtyStep":"0.01","maxOrderQty":"500",
+         "minOrderQty":"0.01","quantityPrecision":2},
+       "lastPrice":260,"change24h":-5.454546,"markPrice":281.91531579}
+    THIS RESOLVES THE CONTRACT-MULTIPLIER QUESTION that's been flagged
+    UNCONFIRMED since architecture.md Section C: lotSizeFilter shows
+    quantity is specified DIRECTLY IN BTC (0.01 BTC minimum, 0.01 BTC step)
+    -- same convention as Delta (per ev_engine.py's Bug #2 finding that
+    Delta quotes/sizes in raw BTC terms too). There is no separate
+    "contract = N BTC" abstraction to multiply by; a caller sizing a Shark
+    order works directly in BTC quantity, same units as everywhere else in
+    this codebase. tickSize is confirmed as "5" (price units), NOT the 0.5
+    placeholder that had been assumed elsewhere.
+
+    UNCONFIRMED CAVEAT: the request PAYLOAD for this POST was not captured
+    (only Headers were visible, not the Payload tab) -- get_instrument_info()
+    below assumes a `{"symbol": "..."}` JSON body as the obvious shape, but
+    this is an assumption, not a confirmed fact like everything else in this
+    docstring. If it 4xxs, capture the real Payload tab before changing the
+    guess to something else.
 """
 
 from __future__ import annotations
@@ -96,17 +137,13 @@ _REQUEST_TIMEOUT_SEC = 10
 class SharkOptionsRestError(RuntimeError):
     """Raised on any failure calling api-options.sharkexchange.in --
     including the HTTP-200-wrapped-error case documented above. Callers
-    should treat this as 'we don't know the real orderbook state', never
-    as 'confirmed empty book'."""
+    should treat this as 'we don't know the real state', never as
+    'confirmed empty/absent'."""
 
 
 class SharkSymbolExpiredError(SharkOptionsRestError):
     """Specifically: the requested symbol's expiry has already passed
-    (Shark's own "Symbol expired." message). Distinguished from other
-    SharkOptionsRestError cases because a caller (e.g. the scanner) may
-    want to react differently -- e.g. stop trying that expiry entirely
-    rather than retrying, versus a transient network error which might be
-    worth retrying."""
+    (Shark's own "Symbol expired." message)."""
 
 
 def _dec_or_none(v) -> Decimal | None:
@@ -128,14 +165,14 @@ class SharkOptionsPublicClient:
     def __init__(self, session: requests.Session | None = None) -> None:
         self._session = session or requests.Session()
 
+    # -- orderbook (confirmed 2026-08-24) --------------------------------
+
     def get_orderbook_raw(self, symbol: str) -> dict:
         """
         Confirmed endpoint -- see module docstring. Returns the raw parsed
         JSON response ONLY if it looks like a real orderbook (has a "bids"
         or "asks" key). Raises SharkOptionsRestError (or the more specific
-        SharkSymbolExpiredError) for the HTTP-200-wrapped-error case --
-        see this module's CRITICAL BUG note. Never silently returns an
-        error envelope as if it were real data.
+        SharkSymbolExpiredError) for the HTTP-200-wrapped-error case.
         """
         url = f"{_BASE_URL}/v1/market/orderBook"
         try:
@@ -143,9 +180,6 @@ class SharkOptionsPublicClient:
         except requests.RequestException as exc:
             raise SharkOptionsRestError(f"GET {url} (symbol={symbol}) failed: {exc}") from exc
 
-        # Real HTTP-level failure -- still worth checking even though the
-        # confirmed error case above uses 200, in case OTHER failure modes
-        # (rate limiting, auth, etc.) use real status codes instead.
         if resp.status_code != 200:
             raise SharkOptionsRestError(
                 f"GET {url} (symbol={symbol}) returned HTTP {resp.status_code}: {resp.text[:300]}"
@@ -156,12 +190,6 @@ class SharkOptionsPublicClient:
         except ValueError as exc:
             raise SharkOptionsRestError(f"GET {url} (symbol={symbol}) returned non-JSON body: {resp.text[:300]}") from exc
 
-        # THE FIX: detect Shark's HTTP-200-wrapped-error envelope. Confirmed
-        # shape has a top-level "statusCode" and/or "error"/"name" key and
-        # NO "bids"/"asks" keys -- a real orderbook response never has
-        # these. Checking for the error shape explicitly (rather than just
-        # "bids" is missing) so a genuinely different-but-valid response
-        # shape wouldn't be misclassified as this specific known error.
         if "bids" not in body and "asks" not in body:
             err_message = body.get("message") or body.get("response", {}).get("message") if isinstance(body.get("response"), dict) else body.get("message")
             status_code = body.get("statusCode") or (body.get("response") or {}).get("statusCode") if isinstance(body.get("response"), dict) else body.get("statusCode")
@@ -179,13 +207,8 @@ class SharkOptionsPublicClient:
     def get_orderbook_snapshot(self, symbol: str) -> MarketSnapshot:
         """
         Same data as get_orderbook_raw(), normalized into a MarketSnapshot.
-        Raises (does not silently return empty) if get_orderbook_raw()
-        couldn't get real data -- see that method and this module's
-        CRITICAL BUG note.
         best_bid/best_ask are the top of the confirmed bids/asks arrays
-        (bids are given descending, asks ascending -- confirmed from the
-        real captured example in the module docstring, where bids started
-        at 1030 and descended, asks started at 1115 and ascended).
+        (bids descending, asks ascending -- confirmed from real captures).
         """
         raw = self.get_orderbook_raw(symbol)
 
@@ -211,3 +234,100 @@ class SharkOptionsPublicClient:
             ask_size=ask_size,
             book_levels=book_levels,
         )
+
+    # -- newly confirmed 2026-08-28 ---------------------------------------
+
+    def get_base_pairs(self) -> list[dict]:
+        """
+        Confirmed endpoint -- see module docstring. Returns the raw list,
+        e.g. one entry has baseCoin="BTC", makerFeePercentage=0.015,
+        takerFeePercentage=0.02, etc. No transformation applied here so
+        callers see exactly what the API returns.
+        """
+        url = f"{_BASE_URL}/v1/exchange/basePairs"
+        try:
+            resp = self._session.get(url, timeout=_REQUEST_TIMEOUT_SEC)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            raise SharkOptionsRestError(f"GET {url} failed: {exc}") from exc
+        except ValueError as exc:
+            raise SharkOptionsRestError(f"GET {url} returned non-JSON body") from exc
+
+    def get_delivery_times(self, base_coin: str, quote_coin: str) -> list[datetime]:
+        """
+        Confirmed endpoint -- see module docstring. Returns real listed
+        expiry timestamps as timezone-aware UTC datetimes, sorted ascending.
+        Replaces guessing/hand-typing an expiry date/label.
+        """
+        url = f"{_BASE_URL}/v1/exchange/delivery-times"
+        try:
+            resp = self._session.get(
+                url, params={"baseCoin": base_coin, "quoteCoin": quote_coin}, timeout=_REQUEST_TIMEOUT_SEC
+            )
+            resp.raise_for_status()
+            raw_list = resp.json()
+        except requests.RequestException as exc:
+            raise SharkOptionsRestError(f"GET {url} failed: {exc}") from exc
+        except ValueError as exc:
+            raise SharkOptionsRestError(f"GET {url} returned non-JSON body") from exc
+
+        if not isinstance(raw_list, list):
+            raise SharkOptionsRestError(
+                f"GET {url} expected a JSON array of epoch-ms timestamps, got: {str(raw_list)[:200]}"
+            )
+
+        return sorted(datetime.fromtimestamp(ms / 1000, tz=timezone.utc) for ms in raw_list)
+
+    def get_next_delivery_time(self, base_coin: str, quote_coin: str, after: datetime | None = None) -> datetime:
+        """Convenience wrapper: the earliest confirmed delivery time that is
+        still in the future (>= `after`, default now). Raises
+        SharkOptionsRestError if none are found (e.g. delivery-times list
+        was empty or all entries are in the past)."""
+        after = after or datetime.now(timezone.utc)
+        for dt in self.get_delivery_times(base_coin, quote_coin):
+            if dt >= after:
+                return dt
+        raise SharkOptionsRestError(
+            f"No delivery time >= {after.isoformat()} found for {base_coin}/{quote_coin} -- "
+            "Shark may not have listed the next expiry yet."
+        )
+
+    def get_instrument_info(self, symbol: str) -> dict:
+        """
+        Confirmed endpoint (response shape), UNCONFIRMED request payload --
+        see module docstring's caveat. Assumes POST body {"symbol": symbol}.
+        Real response includes priceFilter.tickSize and
+        lotSizeFilter.{qtyStep,minOrderQty,maxOrderQty} -- see module
+        docstring for why this resolves the contract-multiplier question
+        (quantity is directly in BTC, no separate multiplier).
+        """
+        url = f"{_BASE_URL}/v1/exchange/instrument-info-symbol"
+        try:
+            resp = self._session.post(url, json={"symbol": symbol}, timeout=_REQUEST_TIMEOUT_SEC)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            raise SharkOptionsRestError(
+                f"POST {url} (symbol={symbol}) failed: {exc} -- NOTE: request payload shape is "
+                f"UNCONFIRMED for this endpoint (see module docstring), this may be a wrong-body "
+                f"issue rather than a real absence of data."
+            ) from exc
+        except ValueError as exc:
+            raise SharkOptionsRestError(f"POST {url} (symbol={symbol}) returned non-JSON body") from exc
+
+    def get_min_order_qty_btc(self, symbol: str) -> Decimal | None:
+        """Convenience wrapper over get_instrument_info(): the confirmed
+        minimum order size in BTC for a given symbol, or None if the field
+        is missing from the response (should not happen per the confirmed
+        response shape, but not assumed blindly)."""
+        info = self.get_instrument_info(symbol)
+        lot = info.get("lotSizeFilter") or {}
+        return _dec_or_none(lot.get("minOrderQty"))
+
+    def get_tick_size(self, symbol: str) -> Decimal | None:
+        """Convenience wrapper over get_instrument_info(): confirmed tick
+        size ("5" in the captured example), or None if missing."""
+        info = self.get_instrument_info(symbol)
+        pf = info.get("priceFilter") or {}
+        return _dec_or_none(pf.get("tickSize"))
