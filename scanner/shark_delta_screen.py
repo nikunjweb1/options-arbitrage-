@@ -9,14 +9,13 @@ on Delta (5:30 PM IST expiry, same calendar day). Net entry credit
 WHY THIS IS A SCREENING TOOL, NOT A SIZED P&L ENGINE (be honest about the
 gap): pricing/ev_engine.py's LeanEVEngine requires a confirmed
 contract_multiplier for BOTH legs to produce real per-contract dollar P&L.
-Shark's multiplier is NOT confirmed (architecture.md Section C: the "Min
-Order Size" field renders client-side, unconfirmed as of this writing) --
-per this project's explicit rule, that number is never guessed or
-hardcoded. So this scanner does NOT call LeanEVEngine and does NOT produce
-a dollar EV figure. For sized, tax-aware recommendations, use
-pricing/manual_spread_finder.py once Shark's lot size is confirmed -- this
-scanner's job is the FIRST-PASS screen: is there anything worth typing into
-that tool right now, without you having to watch two browser tabs by hand.
+Per exchange_adapters/shark_rest_options.py's 2026-08-28 confirmation,
+Shark's own instrument-info-symbol endpoint shows quantity is specified
+DIRECTLY IN BTC (0.01 BTC min/step) -- same convention as Delta, so there
+is no separate multiplier to resolve anymore. What this scanner still does
+NOT do is call LeanEVEngine or produce a dollar EV figure -- that lives in
+pricing/manual_spread_finder.py, which is the sized, tax-aware next step
+once this screen flags something worth a closer look.
 
 NO ORDER PLACEMENT: this file only reads public market data (Shark) and
 Delta's public ticker endpoint. Nothing here can place, size, or execute a
@@ -63,18 +62,40 @@ SPEED, 2026-08-26:
   and the scanner automatically falls back to querying everything, rather
   than silently returning zero results because the band was miscentered.
 
+AUTO-EXPIRY, 2026-08-28: --shark-expiry/--delta-date are now OPTIONAL.
+When omitted, the scanner calls the newly-confirmed
+SharkOptionsPublicClient.get_next_delivery_time() (real listed expiry
+timestamps straight from Shark, see shark_rest_options.py) to find the
+next expiry >= now, and uses that same calendar date for Delta's side too
+-- this is a real assumption worth stating plainly: it assumes Shark and
+Delta's "next daily expiry" fall on the SAME calendar date, which has held
+for every expiry observed so far (both roll daily), but is NOT verified
+against Delta's own listed expiries independently confirming the same
+date. If Delta doesn't have a contract for that exact date (e.g. Delta's
+own listing lags Shark's), get_option_chain() will simply return 0
+contracts for that date -- visible immediately in the "Delta: 0 contracts
+found" log line, not a silent wrong answer. Pass --shark-expiry/--delta-date
+explicitly to bypass auto-detection entirely, same as before.
+
 AUTOMATION, 2026-08-26: --watch runs the screen on a fixed interval forever
 (Ctrl+C to stop), printing a one-line status each cycle and the full table
 + a Telegram alert ONLY when at least one strike actually clears the
 net-credit bar -- so you can leave this running without it spamming you,
-and get pinged the moment something real appears. This is the automation of
-FINDING an opportunity; executing on it is still, deliberately, entirely
-manual -- see NO ORDER PLACEMENT above.
+and get pinged the moment something real appears. Combined with
+AUTO-EXPIRY above, --watch can now be left running across a day boundary
+without manual intervention: each cycle re-resolves the next expiry from
+scratch rather than using a date fixed at startup, so it naturally rolls
+to the next day's expiry once the current one settles. This is the
+automation of FINDING an opportunity; executing on it is still,
+deliberately, entirely manual -- see NO ORDER PLACEMENT above.
 
 Usage:
+    # Auto-detects the next live expiry on both exchanges -- no manual date typing:
+    python -m scanner.shark_delta_screen --underlying BTC
+    python -m scanner.shark_delta_screen --underlying BTC --watch --interval-sec 60
+
+    # Or pin to a specific expiry explicitly (old behavior, still supported):
     python -m scanner.shark_delta_screen --underlying BTC --shark-expiry 27AUG26 --delta-date 2026-08-27
-    python -m scanner.shark_delta_screen --underlying BTC --shark-expiry 27AUG26 --delta-date 2026-08-27 --watch --interval-sec 60
-    python -m scanner.shark_delta_screen --underlying BTC --shark-expiry 27AUG26 --delta-date 2026-08-27 --strike-band-pct 10
 """
 
 from __future__ import annotations
@@ -101,6 +122,33 @@ logger = logging.getLogger("shark_delta_screen")
 
 _MAX_WORKERS = 10  # concurrent REST calls per side -- polite to both APIs, still a large speedup over sequential
 _DEFAULT_STRIKE_BAND_PCT = 8.0  # see module docstring's STRIKE-BAND FILTERING note
+
+_MONTH_ABBR = {
+    1: "JAN", 2: "FEB", 3: "MAR", 4: "APR", 5: "MAY", 6: "JUN",
+    7: "JUL", 8: "AUG", 9: "SEP", 10: "OCT", 11: "NOV", 12: "DEC",
+}
+
+
+def _resolve_expiry(
+    shark_rest: SharkOptionsPublicClient, underlying: str, quote: str = "USDT"
+) -> tuple[str, datetime]:
+    """
+    Returns (shark_expiry_ddmmmyy, delta_expiry_date) for the next live
+    expiry, per module docstring's AUTO-EXPIRY note. Raises
+    SharkOptionsRestError if Shark's delivery-times call fails or returns
+    nothing usable -- callers should not proceed with a guessed date if
+    this fails, per this project's no-guessing rule.
+    """
+    next_dt = shark_rest.get_next_delivery_time(underlying, quote)
+    shark_expiry = f"{next_dt.day:02d}{_MONTH_ABBR[next_dt.month]}{next_dt.year % 100:02d}"
+    # Delta side uses the same calendar date -- see module docstring's
+    # AUTO-EXPIRY assumption note.
+    delta_expiry_date = datetime(next_dt.year, next_dt.month, next_dt.day, tzinfo=timezone.utc)
+    logger.info(
+        "Auto-detected next expiry: Shark=%s (delivery %s), Delta date=%s",
+        shark_expiry, next_dt.isoformat(), delta_expiry_date.date(),
+    )
+    return shark_expiry, delta_expiry_date
 
 
 def _infer_spot_price(delta_tickers: dict) -> Decimal | None:
@@ -168,13 +216,16 @@ def _fetch_shark_bid(shark_rest: SharkOptionsPublicClient, symbol: str) -> tuple
 
 def run_screen(
     underlying: str,
-    shark_expiry_ddmmmyy: str,
-    delta_expiry_date: datetime,
+    shark_expiry_ddmmmyy: str | None = None,
+    delta_expiry_date: datetime | None = None,
     ws_listen_seconds: int = 0,
     strike_band_pct: float = _DEFAULT_STRIKE_BAND_PCT,
 ) -> list[ScreenResult]:
     delta = DeltaAdapter()
     shark_rest = SharkOptionsPublicClient()
+
+    if shark_expiry_ddmmmyy is None or delta_expiry_date is None:
+        shark_expiry_ddmmmyy, delta_expiry_date = _resolve_expiry(shark_rest, underlying)
 
     delta_contracts = delta.get_option_chain(underlying, expiry=delta_expiry_date)
     logger.info("Delta: %d contracts found for %s on %s", len(delta_contracts), underlying, delta_expiry_date.date())
@@ -377,13 +428,18 @@ def _format_telegram_alert(results: list[ScreenResult], underlying: str) -> str:
 
 def run_watch(
     underlying: str,
-    shark_expiry: str,
-    delta_expiry: datetime,
+    shark_expiry: str | None,
+    delta_expiry: datetime | None,
     interval_sec: int,
     ws_listen_seconds: int,
     strike_band_pct: float,
 ) -> None:
-    print(f"Watching {underlying} every {interval_sec}s (Ctrl+C to stop). Full table + Telegram alert only when something clears the net-credit bar.\n")
+    auto = shark_expiry is None or delta_expiry is None
+    print(
+        f"Watching {underlying} every {interval_sec}s (Ctrl+C to stop). "
+        f"{'Auto-detecting next expiry each cycle.' if auto else f'Pinned to {shark_expiry}/{delta_expiry.date()}.'} "
+        f"Full table + Telegram alert only when something clears the net-credit bar.\n"
+    )
     cycle = 0
     while True:
         cycle += 1
@@ -416,8 +472,8 @@ def run_watch(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--underlying", default="BTC")
-    parser.add_argument("--shark-expiry", required=True, help="e.g. 27AUG26 -- must match Shark's real listed expiry")
-    parser.add_argument("--delta-date", required=True, help="e.g. 2026-08-27 -- must match Delta's real listed expiry date")
+    parser.add_argument("--shark-expiry", default=None, help="e.g. 27AUG26. Omit to auto-detect the next live expiry from Shark's delivery-times endpoint.")
+    parser.add_argument("--delta-date", default=None, help="e.g. 2026-08-27. Omit to auto-detect (same calendar date as --shark-expiry).")
     parser.add_argument("--ws-listen-seconds", type=int, default=0, help="Listen to Shark's WS for IV data before scanning. Default 0 (off) -- see module docstring's SPEED note.")
     parser.add_argument("--strike-band-pct", type=float, default=_DEFAULT_STRIKE_BAND_PCT,
                          help=f"Only query Shark for strikes within this %% of live spot price. Default {_DEFAULT_STRIKE_BAND_PCT}. See module docstring's STRIKE-BAND FILTERING note.")
@@ -428,7 +484,10 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
-    delta_expiry = datetime.strptime(args.delta_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    delta_expiry = (
+        datetime.strptime(args.delta_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if args.delta_date else None
+    )
 
     if args.watch:
         run_watch(args.underlying, args.shark_expiry, delta_expiry, args.interval_sec, args.ws_listen_seconds, args.strike_band_pct)
